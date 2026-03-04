@@ -97,7 +97,41 @@ engine.Add(time.Now().Unix(), 102, 5001, 240)
 
 ```
 
-### 3. Querying Real-Time Data (In-Memory)
+### 3. Generating Fake Data (SiteID + ProbeID)
+
+The engine exposes synthetic data helpers for backfill/testing workflows.
+
+```go
+siteIDs := []int64{100, 101}
+
+// ProbeID maps to testID internally. Each probe carries its siteID.
+probeIDs := []tsdb.ProbeWithSite{
+    {ProbeID: 5001, SiteID: 100},
+    {ProbeID: 5002, SiteID: 100},
+    {ProbeID: 5001, SiteID: 101},
+}
+
+// Generate the last 90 days at 5-minute intervals.
+written, err := engine.GenerateFakeData(siteIDs, probeIDs, 90, 5*time.Minute)
+if err != nil {
+    log.Fatalf("fake data generation failed: %v", err)
+}
+log.Printf("Generated %d points", written)
+
+// Optional: generate for an explicit Unix-second range.
+start := time.Now().Add(-30 * 24 * time.Hour).Unix()
+end := time.Now().Unix()
+written, err = engine.GenerateFakeDataRange(siteIDs, probeIDs, start, end, 5*time.Minute)
+if err != nil {
+    log.Fatalf("fake range generation failed: %v", err)
+}
+```
+
+API:
+- `GenerateFakeData(siteIDs []int64, probeIDs []ProbeWithSite, numberOfDays int, interval time.Duration) (int, error)`
+- `GenerateFakeDataRange(siteIDs []int64, probeIDs []ProbeWithSite, startTime, endTime int64, interval time.Duration) (int, error)`
+
+### 4. Querying Real-Time Data (In-Memory)
 
 Use these functions to populate live dashboards. They read directly from the memory map and return instantly.
 
@@ -113,7 +147,7 @@ for testID, point := range siteMetrics {
 
 ```
 
-### 4. Querying Historical Data (Disk / BadgerDB)
+### 5. Querying Historical Data (Disk / BadgerDB)
 
 Use these functions to render historical charts. They perform prefix scans on BadgerDB and decompress the delta-encoded chunks on the fly.
 
@@ -206,10 +240,10 @@ CompactionTiers: []tsdb.CompactionTier{
 The engine stores data in BadgerDB using Big Endian formatting to ensure chronological prefix scanning works correctly.
 
 * **Test Prefix:** `test-{tier}!{TestID}!{Timestamp}` -> `CompressedChunk[]`
-* **Site Prefix:** `site-{tier}!{SiteID}!{Timestamp}` -> `CompressedChunk[]`
+* **Site Prefix:** `site-{tier}!{SiteID}!{Timestamp}!{TestID}` -> `CompressedChunk[]`
 
 Examples:
 - `test-1h!0000000000001389!0000000001a2b3c4` (1-hour tier chunk)
-- `site-24h!0000000000000065!0000000001a2b3c4` (24-hour tier chunk)
+- `site-24h!0000000000000065!0000000001a2b3c4!0000000000001389` (24-hour tier chunk)
 
 ---
