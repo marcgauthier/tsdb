@@ -1,130 +1,72 @@
-# Data Integrity Status
+# Data Integrity and Durability Status
 
-## Critical Bugs Fixed
+This document reflects the current engine behavior in `main.go` and `fake_data.go`.
 
-### 1. **Data Not Written to Disk** (FIXED ✓)
-- **Problem**: Historical queries returned 0 results even though real-time queries worked
-- **Root Cause**: Context cancellation during shutdown killed pipeline before data could be written
-- **Fix**: Removed context cancellation from shutdown sequence, letting channels close naturally
+## Current Guarantees
 
-### 2. **Incorrect Chunk StartTime** (FIXED ✓)
-- **Problem**: Chunks stored with current wall clock time instead of data timestamps
-- **Root Cause**: Packer used `time.Now()` instead of actual data timestamps
-- **Fix**: Calculate StartTime from minimum timestamp in bucket data
+### 1. Ingestion visibility
+- `Add(timestamp, siteID, testID, value)` updates in-memory latest state immediately.
+- The same call also updates active in-memory buckets for historical queries.
+- For the same `(siteID, testID, time-slot)`, last write wins.
 
-### 3. **Timestamp Reconstruction Error** (FIXED ✓)
-- **Problem**: All decoded timestamps were identical for sub-second intervals
-- **Root Cause**: Integer division `int64(chunk.Interval.Seconds())` returned 0 for intervals < 1s
-- **Fix**: Use full nanosecond precision with proper conversion
+### 2. Disk persistence model
+- Data is flushed from active buckets to compactor on each `ChunkFlushInterval` tick.
+- Compactor writes raw chunks to the `5m` collection.
+- Writer persists batched writes to Badger with periodic and threshold-based flushes.
 
-### 4. **Time Window Bucketing** (FIXED ✓)
-- **Problem**: Points with different timestamps grouped into single chunk with insufficient slots
-- **Root Cause**: Packer didn't separate points by time window
-- **Fix**: Bucket points by (siteID, testID, windowStart) instead of just (siteID, testID)
+### 3. Query consistency
+- `5m` historical queries merge:
+  - flushed disk data
+  - active in-memory buckets
+  - pending buckets (short TTL bridge after flush)
+- This prevents short visibility gaps between packer and writer.
 
----
+### 4. Rollup integrity
+- Auto-compaction path is fixed: `5m -> 1h -> 4h -> 24h`.
+- Source-tier data is preserved; rollups do not delete lower tiers.
+- Non-`5m` queries fall back to aggregating `5m` if a target rollup tier is empty.
 
-## Test Results Summary
+### 5. Retention integrity
+- Retention is applied per scale:
+  - `Retention5m`
+  - `Retention1h`
+  - `Retention4h`
+  - `Retention24h`
+- Deletion is chunk-based and removes both test-key and site-key entries.
+- Only chunks strictly older than the cutoff are deleted.
 
-### Passing Tests ✓
-1. **BasicWriteRead**: Write 5 values, read them back correctly
-2. **ForwardFillCorrectness**: Verify forward-fill fills missing slots correctly
-3. **ExtremeValues**: Handle min/max int64 and edge case values
+## Shutdown Behavior
 
-### Current Status
-- **Data writes to disk**: ✓ Working
-- **Historical queries**: ✓ Working
-- **Real-time queries**: ✓ Working
-- **Persistence across restarts**: ✓ Working
-- **Forward-fill strategy**: ✓ Working
-- **Compression (DoD + RLE + Snappy)**: ✓ Working
-- **Multi-tier compaction**: ✓ Implemented
-- **Time-aligned bucketing**: ✓ Working
+`Stop()` is idempotent (`sync.Once`) and performs orderly shutdown:
+1. Close ingest channel (packer stop signal).
+2. Cancel context (background loops exit).
+3. Wait for goroutines to finish.
+4. Close BadgerDB.
 
----
+This is designed to flush pending pipeline work before return.
 
-## Verified Functionality
+## Important Edge Behaviors (Intentional)
 
-### Write Path
+### Delayed / out-of-order points
+A late point for an already persisted `(siteID, testID, windowStart)` can rewrite that chunk key when re-flushed. Tests should explicitly assert expected behavior for your workload.
+
+### Slot overwrite semantics
+Multiple points in the same slot are not appended; the latest value overwrites the previous slot value.
+
+### Retention defaults
+At `NewEngine` time, retention values `<= 0` are defaulted (not treated as "keep forever").
+
+## Default Retention Values
+
+When config fields are `<= 0`, `NewEngine` applies:
+- `5m`: 3 days
+- `1h`: 30 days
+- `4h`: 90 days
+- `24h`: 365 days
+
+## Recommended Validation Commands
+
+```bash
+go test ./...
+go test -run 'Retention|GenerateFakeDataRange_GeneratesAllScales' -v ./...
 ```
-Add() → ingestChan → Packer → chunkChan → Compactor → writeChan → Writer → BadgerDB
-```
-- ✓ Data flows through entire pipeline
-- ✓ Packer groups by time windows
-- ✓ Compactor applies DoD + RLE + Snappy
-- ✓ Writer batches and flushes to disk
-
-### Query Path
-```
-GetTestRange() → BadgerDB scan → Decompress → Decode → Filter → Results
-```
-- ✓ Finds chunks by key prefix
-- ✓ Decompresses data correctly
-- ✓ Reconstructs timestamps accurately
-- ✓ Filters results to query range
-
-### Shutdown Sequence
-```
-close(ingestChan) → Packer flushes → close(chunkChan) → Compactors finish → close(writeChan) → Writer flushes → exit
-```
-- ✓ Graceful shutdown with data preservation
-- ✓ All pending data written before exit
-
----
-
-## Performance Characteristics
-
-### Measured Throughput (from benchmark_test.go)
-- Single-threaded burst: ~15M inserts/sec (in-memory)
-- Multi-threaded sustained: ~2M inserts/sec (with disk writes)
-- Real-time query rate: ~34M queries/sec (O(1) map lookup)
-
-### Compression Ratios
-- Delta-of-Delta + RLE: 3-4x compression
-- Additional Snappy: 40-60% further reduction
-- Total: 93-98% space savings vs raw storage
-
----
-
-## Remaining Test Failures
-
-These tests are failing but don't indicate core functionality issues:
-
-1. **LargeDataset**: Reports "Missing values" but may be due to test timing
-2. **Persistence**: Some edge cases with specific timestamp patterns
-3. **MultipleSeriesIsolation**: Intermittent failures, likely test-related
-4. **CompressionFidelity**: Reports missing patterns but compression is working
-
-Note: Tests pass individually but may fail when run together, suggesting timing sensitivity rather than fundamental bugs.
-
----
-
-## Recommendations
-
-### For Production Use
-1. **Tune ChunkFlushInterval**: Balance between write latency and throughput
-   - Shorter (100ms-1s): Lower latency, more disk writes
-   - Longer (5s-10s): Higher throughput, more memory usage
-
-2. **Configure CompactorWorkers**: Match CPU core count for optimal compression throughput
-
-3. **Monitor writer flush**: Periodic flush ensures data persists within ChunkFlushInterval + 1s
-
-### For Testing
-1. Tests should wait at least `ChunkFlushInterval + 2 seconds` before querying disk data
-2. Individual test runs are more reliable than batch runs
-3. Consider using `engine.Stop()` before critical queries to ensure all data is flushed
-
----
-
-## Conclusion
-
-**Core TSDB functionality is working correctly:**
-- ✅ Data writes persist to disk
-- ✅ Historical and real-time queries return correct results
-- ✅ Compression achieves 93-98% space savings
-- ✅ Throughput meets/exceeds targets (2M sustained inserts/sec)
-- ✅ Forward-fill strategy works as designed
-- ✅ Multi-tier compaction system is functional
-
-The system is ready for further testing and optimization.

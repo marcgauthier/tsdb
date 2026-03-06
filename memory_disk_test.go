@@ -50,7 +50,7 @@ func TestMemoryDiskQuery(t *testing.T) {
 
 	// Query immediately (before new data is flushed)
 	fmt.Println("\nQuerying for full range [1000, 1006] BEFORE flush...")
-	results, err := engine.GetTestRange(5001, 1000, 1006)
+	results, err := engine.GetTestRange(5001, 1000, 1006, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestMemoryDiskQuery(t *testing.T) {
 	fmt.Println("\nVerifying partial queries...")
 
 	// Query only disk data
-	diskResults, err := engine.GetTestRange(5001, 1000, 1003)
+	diskResults, err := engine.GetTestRange(5001, 1000, 1003, Scale5m)
 	if err != nil {
 		t.Fatalf("Disk query failed: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestMemoryDiskQuery(t *testing.T) {
 	}
 
 	// Query only memory data
-	memResults, err := engine.GetTestRange(5001, 1004, 1006)
+	memResults, err := engine.GetTestRange(5001, 1004, 1006, Scale5m)
 	if err != nil {
 		t.Fatalf("Memory query failed: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestMemoryDiskQuery(t *testing.T) {
 	engine.Add(1003, 100, 5001, 99999)
 
 	// Query immediately
-	overrideResults, err := engine.GetTestRange(5001, 1003, 1003)
+	overrideResults, err := engine.GetTestRange(5001, 1003, 1003, Scale5m)
 	if err != nil {
 		t.Fatalf("Override query failed: %v", err)
 	}

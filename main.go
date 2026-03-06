@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -30,7 +31,9 @@ type RawBucket struct {
 	TestID    int64
 	StartTime int64
 	Interval  time.Duration
-	Points    []DataPoint
+	Values    []int64
+	Filled    []bool
+	Touched   []int
 }
 
 // CompressionType indicates the compression algorithm used
@@ -40,6 +43,20 @@ const (
 	CompressionNone CompressionType = iota
 	CompressionSnappy
 )
+
+const (
+	Scale5m  = "5m"
+	Scale1h  = "1h"
+	Scale4h  = "4h"
+	Scale24h = "24h"
+)
+
+var scaleDurations = map[string]time.Duration{
+	Scale5m:  5 * time.Minute,
+	Scale1h:  1 * time.Hour,
+	Scale4h:  4 * time.Hour,
+	Scale24h: 24 * time.Hour,
+}
 
 // CompressedChunk is the final payload written to BadgerDB.
 type CompressedChunk struct {
@@ -75,23 +92,59 @@ type bucketKey struct {
 	windowStart int64
 }
 
+type bucketAccumulator struct {
+	siteID      int64
+	testID      int64
+	windowStart int64
+	values      []int64
+	filled      []bool
+	touched     []int
+}
+
 type pendingBucket struct {
-	points    []DataPoint
+	bucket    *bucketAccumulator
 	expiresAt time.Time
+}
+
+type stateShard struct {
+	mu     sync.RWMutex
+	values map[int64]map[int64]DataPoint // map[SiteID]map[TestID]DataPoint
+}
+
+type bucketShard struct {
+	mu      sync.RWMutex
+	buckets map[bucketKey]*bucketAccumulator
+}
+
+type bucketWorkBuffer struct {
+	workValues []int64
+	workFilled []bool
 }
 
 // Config tunes the TSDB engine.
 type Config struct {
-	DBPath               string          // Path to BadgerDB directory
-	BadgerOptions        *badger.Options // Optional BadgerDB options (nil = defaults)
-	ChunkFlushInterval   time.Duration   // How often to flush data to initial chunks
-	IntervalResolution   time.Duration   // Expected time between data points
-	IngestBufferSize     int
-	CompactorWorkers     int
-	CompactionTiers      []CompactionTier // Ordered list of compaction tiers
-	CompactionInterval   time.Duration    // How often to check for chunks to compact
-	EnableAutoCompaction bool             // Enable automatic background compaction
+	DBPath                string          // Path to BadgerDB directory
+	BadgerOptions         *badger.Options // Optional BadgerDB options (nil = defaults)
+	ChunkFlushInterval    time.Duration   // How often to flush ingest buckets (default: 5m)
+	IntervalResolution    time.Duration   // Expected time between data points (default: 5m)
+	IngestBufferSize      int
+	CompactorWorkers      int
+	CompactionTiers       []CompactionTier // Optional/legacy tier metadata; defaults are set if empty
+	CompactionInterval    time.Duration    // How often to check for chunks to compact
+	EnableAutoCompaction  bool             // Enable automatic background compaction
+	Retention5m           time.Duration    // Retention for 5m scale (default: 3d)
+	Retention1h           time.Duration    // Retention for 1h scale (default: 30d)
+	Retention4h           time.Duration    // Retention for 4h scale (default: 90d)
+	Retention24h          time.Duration    // Retention for 24h scale (default: 365d)
+	RetentionInterval     time.Duration    // How often to run retention cleanup
+	WriterFlushMaxEntries int              // Flush write batch when this many entries are buffered
+	WriterFlushMaxBytes   int              // Flush write batch when this many bytes are buffered
 }
+
+const (
+	stateShardCount  = 64
+	bucketShardCount = 64
+)
 
 // ============================================================================
 // Engine Definition
@@ -102,19 +155,23 @@ type Engine struct {
 	config Config
 
 	// Pipeline Channels
-	ingestChan chan DataPoint
-	chunkChan  chan RawBucket
-	writeChan  chan WritePayload
+	ingestChan     chan DataPoint
+	chunkChan      chan RawBucket
+	writeChan      chan WritePayload
+	writerFlushReq chan chan struct{}
 
 	// Real-Time State Keeper
-	stateMu      sync.RWMutex
-	latestValues map[int64]map[int64]DataPoint // map[SiteID]map[TestID]DataPoint
+	stateShards []stateShard
 
 	// Unflushed Data (for memory+disk queries)
-	bucketsMu      sync.RWMutex
-	activeBuckets  map[bucketKey][]DataPoint
+	activeShards   []bucketShard
 	pendingMu      sync.RWMutex
 	pendingBuckets map[bucketKey]pendingBucket
+
+	slotCount        int
+	slotIntervalSecs int64
+	bucketPool       sync.Pool
+	workBufferPool   sync.Pool
 
 	// Concurrency Management
 	wg       sync.WaitGroup
@@ -129,6 +186,51 @@ type Engine struct {
 // ============================================================================
 
 func NewEngine(cfg Config) (*Engine, error) {
+	if cfg.ChunkFlushInterval <= 0 {
+		cfg.ChunkFlushInterval = 5 * time.Minute
+	}
+	if cfg.IntervalResolution <= 0 {
+		cfg.IntervalResolution = 5 * time.Minute
+	}
+	if cfg.IngestBufferSize <= 0 {
+		cfg.IngestBufferSize = 10000
+	}
+	if cfg.CompactorWorkers <= 0 {
+		cfg.CompactorWorkers = 1
+	}
+	if cfg.CompactionInterval <= 0 {
+		cfg.CompactionInterval = 1 * time.Minute
+	}
+	if cfg.WriterFlushMaxEntries <= 0 {
+		cfg.WriterFlushMaxEntries = 4096
+	}
+	if cfg.WriterFlushMaxBytes <= 0 {
+		cfg.WriterFlushMaxBytes = 8 * 1024 * 1024
+	}
+	if cfg.RetentionInterval <= 0 {
+		cfg.RetentionInterval = 10 * time.Minute
+	}
+	if cfg.Retention5m <= 0 {
+		cfg.Retention5m = 3 * 24 * time.Hour
+	}
+	if cfg.Retention1h <= 0 {
+		cfg.Retention1h = 30 * 24 * time.Hour
+	}
+	if cfg.Retention4h <= 0 {
+		cfg.Retention4h = 90 * 24 * time.Hour
+	}
+	if cfg.Retention24h <= 0 {
+		cfg.Retention24h = 365 * 24 * time.Hour
+	}
+	if len(cfg.CompactionTiers) == 0 {
+		cfg.CompactionTiers = []CompactionTier{
+			{Name: Scale5m, Duration: 5 * time.Minute, MinAge: 5 * time.Minute},
+			{Name: Scale1h, Duration: 1 * time.Hour, MinAge: 1 * time.Hour},
+			{Name: Scale4h, Duration: 4 * time.Hour, MinAge: 4 * time.Hour},
+			{Name: Scale24h, Duration: 24 * time.Hour, MinAge: 0},
+		}
+	}
+
 	// Open BadgerDB with provided or default options
 	var opts badger.Options
 	if cfg.BadgerOptions != nil {
@@ -145,18 +247,60 @@ func NewEngine(cfg Config) (*Engine, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &Engine{
-		db:             db,
-		config:         cfg,
-		ingestChan:     make(chan DataPoint, cfg.IngestBufferSize),
-		chunkChan:      make(chan RawBucket, cfg.IngestBufferSize/10),
-		writeChan:      make(chan WritePayload, cfg.IngestBufferSize/10),
-		latestValues:   make(map[int64]map[int64]DataPoint),
-		activeBuckets:  make(map[bucketKey][]DataPoint),
-		pendingBuckets: make(map[bucketKey]pendingBucket),
-		ctx:            ctx,
-		cancel:         cancel,
-	}, nil
+	slotIntervalSecs := int64(cfg.IntervalResolution / time.Second)
+	if slotIntervalSecs <= 0 {
+		slotIntervalSecs = 1
+	}
+	slotCount := int(int64(cfg.ChunkFlushInterval) / int64(cfg.IntervalResolution))
+	if slotCount <= 0 {
+		slotCount = 1
+	}
+
+	stateShards := make([]stateShard, stateShardCount)
+	for i := range stateShards {
+		stateShards[i] = stateShard{values: make(map[int64]map[int64]DataPoint)}
+	}
+
+	activeShards := make([]bucketShard, bucketShardCount)
+	for i := range activeShards {
+		activeShards[i] = bucketShard{buckets: make(map[bucketKey]*bucketAccumulator)}
+	}
+
+	engine := &Engine{
+		db:               db,
+		config:           cfg,
+		ingestChan:       make(chan DataPoint, cfg.IngestBufferSize),
+		chunkChan:        make(chan RawBucket, cfg.IngestBufferSize/10),
+		writeChan:        make(chan WritePayload, cfg.IngestBufferSize/10),
+		writerFlushReq:   make(chan chan struct{}, 1),
+		stateShards:      stateShards,
+		activeShards:     activeShards,
+		pendingBuckets:   make(map[bucketKey]pendingBucket),
+		slotCount:        slotCount,
+		slotIntervalSecs: slotIntervalSecs,
+		ctx:              ctx,
+		cancel:           cancel,
+	}
+
+	engine.bucketPool = sync.Pool{
+		New: func() any {
+			return &bucketAccumulator{
+				values:  make([]int64, slotCount),
+				filled:  make([]bool, slotCount),
+				touched: make([]int, 0, slotCount),
+			}
+		},
+	}
+	engine.workBufferPool = sync.Pool{
+		New: func() any {
+			return &bucketWorkBuffer{
+				workValues: make([]int64, slotCount),
+				workFilled: make([]bool, slotCount),
+			}
+		},
+	}
+
+	return engine, nil
 }
 
 func (e *Engine) Start() {
@@ -190,6 +334,11 @@ func (e *Engine) Start() {
 		e.wg.Add(1)
 		go e.runChunkCompaction()
 	}
+
+	if e.hasRetentionConfigured() {
+		e.wg.Add(1)
+		go e.runRetentionCleanup()
+	}
 }
 
 func (e *Engine) Stop() error {
@@ -210,6 +359,171 @@ func (e *Engine) Stop() error {
 	return e.stopErr
 }
 
+func stateShardIndex(siteID int64) int {
+	u := uint64(siteID)
+	u ^= u >> 33
+	u *= 0xff51afd7ed558ccd
+	u ^= u >> 33
+	return int(u % stateShardCount)
+}
+
+func bucketShardIndex(key bucketKey) int {
+	u := uint64(key.siteID*73856093) ^ uint64(key.testID*19349663) ^ uint64(key.windowStart*83492791)
+	u ^= u >> 33
+	u *= 0xff51afd7ed558ccd
+	u ^= u >> 33
+	return int(u % bucketShardCount)
+}
+
+func (e *Engine) getBucketAccumulator(siteID, testID, windowStart int64) *bucketAccumulator {
+	acc := e.bucketPool.Get().(*bucketAccumulator)
+	acc.siteID = siteID
+	acc.testID = testID
+	acc.windowStart = windowStart
+	acc.touched = acc.touched[:0]
+	return acc
+}
+
+func (e *Engine) releaseBucketAccumulator(acc *bucketAccumulator) {
+	for _, idx := range acc.touched {
+		acc.filled[idx] = false
+		acc.values[idx] = 0
+	}
+	acc.touched = acc.touched[:0]
+	e.bucketPool.Put(acc)
+}
+
+func (e *Engine) releaseWorkBuffer(values []int64, filled []bool, touched []int) {
+	for _, idx := range touched {
+		filled[idx] = false
+		values[idx] = 0
+	}
+	e.workBufferPool.Put(&bucketWorkBuffer{
+		workValues: values,
+		workFilled: filled,
+	})
+}
+
+func (e *Engine) appendBucketPoints(acc *bucketAccumulator, start, end int64, out []DataPoint) []DataPoint {
+	for _, idx := range acc.touched {
+		if !acc.filled[idx] {
+			continue
+		}
+		ts := acc.windowStart + int64(idx)*e.slotIntervalSecs
+		if ts < start || ts > end {
+			continue
+		}
+		out = append(out, DataPoint{
+			Timestamp: ts,
+			SiteID:    acc.siteID,
+			TestID:    acc.testID,
+			Value:     acc.values[idx],
+		})
+	}
+	return out
+}
+
+func (e *Engine) flushActiveBuckets() {
+	snapshots := make([]map[bucketKey]*bucketAccumulator, 0, len(e.activeShards))
+	for i := range e.activeShards {
+		shard := &e.activeShards[i]
+		shard.mu.Lock()
+		current := shard.buckets
+		shard.buckets = make(map[bucketKey]*bucketAccumulator)
+		shard.mu.Unlock()
+		snapshots = append(snapshots, current)
+	}
+
+	now := time.Now()
+	pendingTTL := e.config.ChunkFlushInterval + time.Second
+	if pendingTTL < 2*time.Second {
+		pendingTTL = 2 * time.Second
+	}
+
+	e.pendingMu.Lock()
+	for key, pb := range e.pendingBuckets {
+		if now.After(pb.expiresAt) {
+			e.releaseBucketAccumulator(pb.bucket)
+			delete(e.pendingBuckets, key)
+		}
+	}
+	for _, bucketMap := range snapshots {
+		for key, acc := range bucketMap {
+			if len(acc.touched) == 0 {
+				e.releaseBucketAccumulator(acc)
+				continue
+			}
+			if existing, ok := e.pendingBuckets[key]; ok {
+				e.releaseBucketAccumulator(existing.bucket)
+			}
+			e.pendingBuckets[key] = pendingBucket{
+				bucket:    acc,
+				expiresAt: now.Add(pendingTTL),
+			}
+		}
+	}
+	e.pendingMu.Unlock()
+
+	for _, bucketMap := range snapshots {
+		for key, acc := range bucketMap {
+			if len(acc.touched) == 0 {
+				continue
+			}
+
+			work := e.workBufferPool.Get().(*bucketWorkBuffer)
+			touched := make([]int, len(acc.touched))
+			copy(touched, acc.touched)
+			for _, idx := range touched {
+				work.workValues[idx] = acc.values[idx]
+				work.workFilled[idx] = true
+			}
+
+			e.chunkChan <- RawBucket{
+				SiteID:    key.siteID,
+				TestID:    key.testID,
+				StartTime: key.windowStart,
+				Interval:  e.config.IntervalResolution,
+				Values:    work.workValues,
+				Filled:    work.workFilled,
+				Touched:   touched,
+			}
+		}
+	}
+}
+
+func (e *Engine) waitPipelinesQuiet(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	stable := 0
+	for time.Now().Before(deadline) {
+		if len(e.chunkChan) == 0 && len(e.writeChan) == 0 {
+			stable++
+			if stable >= 5 {
+				return true
+			}
+		} else {
+			stable = 0
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
+func (e *Engine) flushWriterNow(timeout time.Duration) bool {
+	ack := make(chan struct{})
+	select {
+	case e.writerFlushReq <- ack:
+	case <-time.After(timeout):
+		return false
+	}
+
+	select {
+	case <-ack:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // ============================================================================
 // Public API: Ingestion
 // ============================================================================
@@ -223,12 +537,14 @@ func (e *Engine) Add(timestamp, siteID, testID, value int64) {
 	}
 
 	// Update real-time mirror synchronously for immediate query visibility.
-	e.stateMu.Lock()
-	if _, exists := e.latestValues[pt.SiteID]; !exists {
-		e.latestValues[pt.SiteID] = make(map[int64]DataPoint)
+	stateIdx := stateShardIndex(pt.SiteID)
+	stateShard := &e.stateShards[stateIdx]
+	stateShard.mu.Lock()
+	if _, exists := stateShard.values[pt.SiteID]; !exists {
+		stateShard.values[pt.SiteID] = make(map[int64]DataPoint)
 	}
-	e.latestValues[pt.SiteID][pt.TestID] = pt
-	e.stateMu.Unlock()
+	stateShard.values[pt.SiteID][pt.TestID] = pt
+	stateShard.mu.Unlock()
 
 	// Add to active bucket synchronously to avoid ingestion/query races.
 	flushIntervalSecs := int64(e.config.ChunkFlushInterval.Seconds())
@@ -241,12 +557,25 @@ func (e *Engine) Add(timestamp, siteID, testID, value int64) {
 		testID:      pt.TestID,
 		windowStart: windowStart,
 	}
-	e.bucketsMu.Lock()
-	e.activeBuckets[key] = append(e.activeBuckets[key], pt)
-	e.bucketsMu.Unlock()
+	slotIdx := int((pt.Timestamp - windowStart) / e.slotIntervalSecs)
+	if slotIdx < 0 || slotIdx >= e.slotCount {
+		return
+	}
 
-	// Keep the pipeline signal for compaction/write flow.
-	e.ingestChan <- pt
+	bucketIdx := bucketShardIndex(key)
+	bucketShard := &e.activeShards[bucketIdx]
+	bucketShard.mu.Lock()
+	acc := bucketShard.buckets[key]
+	if acc == nil {
+		acc = e.getBucketAccumulator(pt.SiteID, pt.TestID, windowStart)
+		bucketShard.buckets[key] = acc
+	}
+	if !acc.filled[slotIdx] {
+		acc.filled[slotIdx] = true
+		acc.touched = append(acc.touched, slotIdx)
+	}
+	acc.values[slotIdx] = pt.Value // Last write wins inside the slot.
+	bucketShard.mu.Unlock()
 }
 
 // ============================================================================
@@ -261,64 +590,18 @@ func (e *Engine) runPacker() {
 	ticker := time.NewTicker(e.config.ChunkFlushInterval)
 	defer ticker.Stop()
 
-	flushBuckets := func() {
-		// Lock and snapshot current buckets
-		e.bucketsMu.Lock()
-		bucketsToFlush := e.activeBuckets
-		e.activeBuckets = make(map[bucketKey][]DataPoint)
-		e.bucketsMu.Unlock()
-
-		// Keep flushed buckets queryable for a short period to avoid
-		// visibility gaps between packer flush and disk commit.
-		now := time.Now()
-		pendingTTL := e.config.ChunkFlushInterval + time.Second
-		if pendingTTL < 2*time.Second {
-			pendingTTL = 2 * time.Second
-		}
-
-		e.pendingMu.Lock()
-		for key, points := range bucketsToFlush {
-			if len(points) == 0 {
-				continue
-			}
-			e.pendingBuckets[key] = pendingBucket{
-				points:    points,
-				expiresAt: now.Add(pendingTTL),
-			}
-		}
-		for key, pb := range e.pendingBuckets {
-			if now.After(pb.expiresAt) {
-				delete(e.pendingBuckets, key)
-			}
-		}
-		e.pendingMu.Unlock()
-
-		// Send snapshots to compactor
-		for key, points := range bucketsToFlush {
-			if len(points) > 0 {
-				e.chunkChan <- RawBucket{
-					SiteID:    key.siteID,
-					TestID:    key.testID,
-					StartTime: key.windowStart,
-					Interval:  e.config.IntervalResolution,
-					Points:    points,
-				}
-			}
-		}
-	}
-
 	for {
 		select {
 		case _, ok := <-e.ingestChan:
 			if !ok {
 				// Channel closed, flush and exit
-				flushBuckets()
+				e.flushActiveBuckets()
 				return
 			}
 
 		case <-ticker.C:
 			// 3. Seal buckets and send to compactor
-			flushBuckets()
+			e.flushActiveBuckets()
 		}
 	}
 }
@@ -334,7 +617,8 @@ func (e *Engine) runCompactor() {
 		}
 
 		// Skip empty buckets
-		if len(raw.Points) == 0 {
+		if len(raw.Touched) == 0 {
+			e.releaseWorkBuffer(raw.Values, raw.Filled, raw.Touched)
 			continue
 		}
 
@@ -344,11 +628,7 @@ func (e *Engine) runCompactor() {
 			intervalNanos = int64(time.Second) // Minimum 1 second interval
 		}
 
-		// Calculate number of time slots in this chunk
-		numSlots := int(int64(e.config.ChunkFlushInterval) / intervalNanos)
-		if numSlots == 0 {
-			numSlots = 1
-		}
+		numSlots := len(raw.Values)
 
 		// Convert to seconds for timestamp calculations
 		intervalSecs := intervalNanos / int64(time.Second)
@@ -356,29 +636,29 @@ func (e *Engine) runCompactor() {
 			intervalSecs = 1
 		}
 
-		// Create a map of timestamp -> value for quick lookup
-		pointMap := make(map[int64]int64)
-		for _, pt := range raw.Points {
-			// Calculate which slot this point belongs to
-			offset := pt.Timestamp - raw.StartTime
-			index := offset / intervalSecs
-			slotTimestamp := raw.StartTime + (index * intervalSecs)
-			pointMap[slotTimestamp] = pt.Value
+		values := raw.Values
+		firstKnown := -1
+		for i := 0; i < numSlots; i++ {
+			if raw.Filled[i] {
+				firstKnown = i
+				break
+			}
+		}
+		if firstKnown < 0 {
+			e.releaseWorkBuffer(raw.Values, raw.Filled, raw.Touched)
+			continue
 		}
 
-		// Build forward-filled array of values
-		values := make([]int64, numSlots)
-		lastValue := raw.Points[0].Value // Start with first actual value
-
-		for i := 0; i < numSlots; i++ {
-			slotTimestamp := raw.StartTime + (int64(i) * intervalSecs)
-			if val, exists := pointMap[slotTimestamp]; exists {
-				values[i] = val
-				lastValue = val // Update last known value
-			} else {
-				// Forward-fill: use previous value
-				values[i] = lastValue
+		lastValue := values[firstKnown]
+		for i := 0; i < firstKnown; i++ {
+			values[i] = lastValue
+		}
+		for i := firstKnown + 1; i < numSlots; i++ {
+			if raw.Filled[i] {
+				lastValue = values[i]
+				continue
 			}
+			values[i] = lastValue
 		}
 
 		chunk := CompressedChunk{
@@ -398,11 +678,8 @@ func (e *Engine) runCompactor() {
 		chunk.Data = encodeValuesOptimized(values, chunk.FirstVal)
 		chunk.CompressionType = CompressionSnappy
 
-		// Determine tier name for initial storage
-		tierName := "raw"
-		if len(e.config.CompactionTiers) > 0 {
-			tierName = e.config.CompactionTiers[0].Name
-		}
+		// All raw points are persisted in the 5m collection.
+		tierName := Scale5m
 
 		// Generate Keys
 		testKey := makeTestKey(raw.TestID, raw.StartTime, tierName)
@@ -413,6 +690,8 @@ func (e *Engine) runCompactor() {
 
 		e.writeChan <- WritePayload{Key: testKey, Data: chunkBytes}
 		e.writeChan <- WritePayload{Key: siteKey, Data: chunkBytes}
+
+		e.releaseWorkBuffer(raw.Values, raw.Filled, raw.Touched)
 	}
 }
 
@@ -421,6 +700,24 @@ func (e *Engine) runWriter() {
 	defer e.wg.Done()
 
 	wb := e.db.NewWriteBatch()
+	batchEntries := 0
+	batchBytes := 0
+
+	resetBatch := func() {
+		wb = e.db.NewWriteBatch()
+		batchEntries = 0
+		batchBytes = 0
+	}
+	flushBatch := func() {
+		if batchEntries == 0 {
+			return
+		}
+		if err := wb.Flush(); err != nil {
+			_ = err
+		}
+		wb.Cancel()
+		resetBatch()
+	}
 	defer wb.Cancel()
 
 	// Flush periodically to ensure data is written with bounded latency.
@@ -441,35 +738,30 @@ func (e *Engine) runWriter() {
 	for {
 		select {
 		case <-flushTicker.C:
-			// Periodic flush to ensure data is committed
-			if err := wb.Flush(); err != nil {
-				_ = err
-			}
-			wb = e.db.NewWriteBatch()
+			flushBatch()
+
+		case ack := <-e.writerFlushReq:
+			flushBatch()
+			close(ack)
 
 		case payload, ok := <-e.writeChan:
 			if !ok {
-				// Channel closed, flush remaining data and exit
-				if err := wb.Flush(); err != nil {
-					_ = err
-				}
+				flushBatch()
 				return
 			}
 
 			err := wb.Set(payload.Key, payload.Data)
 			if err != nil {
-				// Try to flush current batch
-				if flushErr := wb.Flush(); flushErr != nil {
-					// In production, log this critical error
-					_ = flushErr
-				}
-
-				// Create new batch and retry
-				wb = e.db.NewWriteBatch()
+				flushBatch()
 				if retryErr := wb.Set(payload.Key, payload.Data); retryErr != nil {
-					// In production, log this critical error - data may be lost
 					_ = retryErr
+					continue
 				}
+			}
+			batchEntries++
+			batchBytes += len(payload.Key) + len(payload.Data)
+			if batchEntries >= e.config.WriterFlushMaxEntries || batchBytes >= e.config.WriterFlushMaxBytes {
+				flushBatch()
 			}
 		}
 	}
@@ -480,10 +772,11 @@ func (e *Engine) runWriter() {
 // ============================================================================
 
 func (e *Engine) GetLatestTest(siteID, testID int64) (DataPoint, bool) {
-	e.stateMu.RLock()
-	defer e.stateMu.RUnlock()
+	shard := &e.stateShards[stateShardIndex(siteID)]
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
-	if site, ok := e.latestValues[siteID]; ok {
+	if site, ok := shard.values[siteID]; ok {
 		if pt, exists := site[testID]; exists {
 			return pt, true
 		}
@@ -492,11 +785,12 @@ func (e *Engine) GetLatestTest(siteID, testID int64) (DataPoint, bool) {
 }
 
 func (e *Engine) GetLatestSite(siteID int64) map[int64]DataPoint {
-	e.stateMu.RLock()
-	defer e.stateMu.RUnlock()
+	shard := &e.stateShards[stateShardIndex(siteID)]
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
 
 	result := make(map[int64]DataPoint)
-	if site, ok := e.latestValues[siteID]; ok {
+	if site, ok := shard.values[siteID]; ok {
 		for testID, pt := range site {
 			result[testID] = pt
 		}
@@ -510,20 +804,17 @@ func (e *Engine) GetLatestSite(siteID int64) map[int64]DataPoint {
 
 // getUnflushedPoints returns unflushed points from activeBuckets for a specific test in a time range
 func (e *Engine) getUnflushedPoints(testID int64, start, end int64) []DataPoint {
-	e.bucketsMu.RLock()
-
 	var results []DataPoint
-	for key, points := range e.activeBuckets {
-		if key.testID == testID {
-			// Check if this bucket's time window overlaps with query range
-			for _, pt := range points {
-				if pt.Timestamp >= start && pt.Timestamp <= end {
-					results = append(results, pt)
-				}
+	for i := range e.activeShards {
+		shard := &e.activeShards[i]
+		shard.mu.RLock()
+		for key, acc := range shard.buckets {
+			if key.testID == testID {
+				results = e.appendBucketPoints(acc, start, end, results)
 			}
 		}
+		shard.mu.RUnlock()
 	}
-	e.bucketsMu.RUnlock()
 
 	now := time.Now()
 	e.pendingMu.RLock()
@@ -532,11 +823,7 @@ func (e *Engine) getUnflushedPoints(testID int64, start, end int64) []DataPoint 
 			continue
 		}
 		if key.testID == testID {
-			for _, pt := range pb.points {
-				if pt.Timestamp >= start && pt.Timestamp <= end {
-					results = append(results, pt)
-				}
-			}
+			results = e.appendBucketPoints(pb.bucket, start, end, results)
 		}
 	}
 	e.pendingMu.RUnlock()
@@ -546,20 +833,17 @@ func (e *Engine) getUnflushedPoints(testID int64, start, end int64) []DataPoint 
 
 // getUnflushedPointsForSite returns unflushed points for a specific site/test in a time range
 func (e *Engine) getUnflushedPointsForSite(siteID, testID int64, start, end int64) []DataPoint {
-	e.bucketsMu.RLock()
-
 	var results []DataPoint
-	for key, points := range e.activeBuckets {
-		if key.siteID == siteID && key.testID == testID {
-			// Check if this bucket's time window overlaps with query range
-			for _, pt := range points {
-				if pt.Timestamp >= start && pt.Timestamp <= end {
-					results = append(results, pt)
-				}
+	for i := range e.activeShards {
+		shard := &e.activeShards[i]
+		shard.mu.RLock()
+		for key, acc := range shard.buckets {
+			if key.siteID == siteID && key.testID == testID {
+				results = e.appendBucketPoints(acc, start, end, results)
 			}
 		}
+		shard.mu.RUnlock()
 	}
-	e.bucketsMu.RUnlock()
 
 	now := time.Now()
 	e.pendingMu.RLock()
@@ -568,11 +852,7 @@ func (e *Engine) getUnflushedPointsForSite(siteID, testID int64, start, end int6
 			continue
 		}
 		if key.siteID == siteID && key.testID == testID {
-			for _, pt := range pb.points {
-				if pt.Timestamp >= start && pt.Timestamp <= end {
-					results = append(results, pt)
-				}
-			}
+			results = e.appendBucketPoints(pb.bucket, start, end, results)
 		}
 	}
 	e.pendingMu.RUnlock()
@@ -582,20 +862,17 @@ func (e *Engine) getUnflushedPointsForSite(siteID, testID int64, start, end int6
 
 // getUnflushedPointsForSiteAll returns unflushed points for all tests at a specific site in a time range
 func (e *Engine) getUnflushedPointsForSiteAll(siteID int64, start, end int64) []DataPoint {
-	e.bucketsMu.RLock()
-
 	var results []DataPoint
-	for key, points := range e.activeBuckets {
-		if key.siteID == siteID {
-			// Check if this bucket's time window overlaps with query range
-			for _, pt := range points {
-				if pt.Timestamp >= start && pt.Timestamp <= end {
-					results = append(results, pt)
-				}
+	for i := range e.activeShards {
+		shard := &e.activeShards[i]
+		shard.mu.RLock()
+		for key, acc := range shard.buckets {
+			if key.siteID == siteID {
+				results = e.appendBucketPoints(acc, start, end, results)
 			}
 		}
+		shard.mu.RUnlock()
 	}
-	e.bucketsMu.RUnlock()
 
 	now := time.Now()
 	e.pendingMu.RLock()
@@ -604,11 +881,7 @@ func (e *Engine) getUnflushedPointsForSiteAll(siteID int64, start, end int64) []
 			continue
 		}
 		if key.siteID == siteID {
-			for _, pt := range pb.points {
-				if pt.Timestamp >= start && pt.Timestamp <= end {
-					results = append(results, pt)
-				}
-			}
+			results = e.appendBucketPoints(pb.bucket, start, end, results)
 		}
 	}
 	e.pendingMu.RUnlock()
@@ -620,49 +893,165 @@ func (e *Engine) getUnflushedPointsForSiteAll(siteID int64, start, end int64) []
 // Public API: Historical Queries (Badger Prefix Scans + Memory)
 // ============================================================================
 
-func (e *Engine) GetTestRange(testID int64, start, end int64) ([]DataPoint, error) {
-	// Use map to deduplicate by timestamp (memory data overrides disk data)
+func floorToWindow(timestamp, windowSec int64) int64 {
+	mod := timestamp % windowSec
+	if mod < 0 {
+		mod += windowSec
+	}
+	return timestamp - mod
+}
+
+func normalizeScale(scale string) (string, int64, error) {
+	if scale == "" {
+		scale = Scale5m
+	}
+	d, ok := scaleDurations[scale]
+	if !ok {
+		return "", 0, fmt.Errorf("invalid scale %q (allowed: %s, %s, %s, %s)", scale, Scale5m, Scale1h, Scale4h, Scale24h)
+	}
+	sec := int64(d / time.Second)
+	if sec <= 0 {
+		sec = 1
+	}
+	return scale, sec, nil
+}
+
+func aggregatePoints(points []DataPoint, aggregateWindowSec int64) []DataPoint {
+	if aggregateWindowSec == 0 || len(points) == 0 {
+		return points
+	}
+
+	windowStart := floorToWindow(points[0].Timestamp, aggregateWindowSec)
+	sum := points[0].Value
+	count := int64(1)
+	first := points[0]
+	results := make([]DataPoint, 0, len(points))
+
+	for i := 1; i < len(points); i++ {
+		pt := points[i]
+		ptWindowStart := floorToWindow(pt.Timestamp, aggregateWindowSec)
+		if ptWindowStart != windowStart {
+			results = append(results, DataPoint{
+				Timestamp: windowStart,
+				SiteID:    first.SiteID,
+				TestID:    first.TestID,
+				Value:     sum / count,
+			})
+			windowStart = ptWindowStart
+			sum = pt.Value
+			count = 1
+			first = pt
+			continue
+		}
+
+		sum += pt.Value
+		count++
+	}
+
+	results = append(results, DataPoint{
+		Timestamp: windowStart,
+		SiteID:    first.SiteID,
+		TestID:    first.TestID,
+		Value:     sum / count,
+	})
+
+	return results
+}
+
+func aggregatePointsByTest(points []DataPoint, aggregateWindowSec int64) []DataPoint {
+	if aggregateWindowSec == 0 || len(points) == 0 {
+		return points
+	}
+
+	type agg struct {
+		siteID int64
+		testID int64
+		sum    int64
+		count  int64
+	}
+
+	currentWindow := floorToWindow(points[0].Timestamp, aggregateWindowSec)
+	perTest := make(map[int64]agg)
+	results := make([]DataPoint, 0, len(points))
+
+	flush := func(windowStart int64) {
+		testIDs := make([]int64, 0, len(perTest))
+		for testID := range perTest {
+			testIDs = append(testIDs, testID)
+		}
+		sort.Slice(testIDs, func(i, j int) bool { return testIDs[i] < testIDs[j] })
+		for _, testID := range testIDs {
+			a := perTest[testID]
+			results = append(results, DataPoint{
+				Timestamp: windowStart,
+				SiteID:    a.siteID,
+				TestID:    a.testID,
+				Value:     a.sum / a.count,
+			})
+		}
+	}
+
+	for _, pt := range points {
+		ptWindow := floorToWindow(pt.Timestamp, aggregateWindowSec)
+		if ptWindow != currentWindow {
+			flush(currentWindow)
+			clear(perTest)
+			currentWindow = ptWindow
+		}
+
+		a := perTest[pt.TestID]
+		if a.count == 0 {
+			a = agg{
+				siteID: pt.SiteID,
+				testID: pt.TestID,
+			}
+		}
+		a.sum += pt.Value
+		a.count++
+		perTest[pt.TestID] = a
+	}
+
+	flush(currentWindow)
+	return results
+}
+
+func (e *Engine) getTestRangeForTier(testID int64, start, end int64, tier string) ([]DataPoint, error) {
+	// Use map to deduplicate by timestamp.
 	pointMap := make(map[int64]DataPoint)
 
-	// 1. Get flushed data from disk
+	// 1. Get flushed data from disk.
 	err := e.db.View(func(txn *badger.Txn) error {
-		// Smart tier selection based on query time range
-		tiers := e.selectTiersForQuery(start, end)
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
 
-		for _, tier := range tiers {
-			opts := badger.DefaultIteratorOptions
-			it := txn.NewIterator(opts)
+		prefix := []byte(fmt.Sprintf("test-%s!%016x!", tier, testID))
+		startKey := []byte(fmt.Sprintf("test-%s!%016x!%016x", tier, testID, start))
 
-			prefix := []byte(fmt.Sprintf("test-%s!%016x!", tier, testID))
-			startKey := []byte(fmt.Sprintf("test-%s!%016x!%016x", tier, testID, start))
+		for it.Seek(startKey); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
 
-			for it.Seek(startKey); it.ValidForPrefix(prefix); it.Next() {
-				item := it.Item()
+			valCopy, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
 
-				valCopy, err := item.ValueCopy(nil)
-				if err != nil {
-					it.Close()
-					return err
-				}
+			chunk := deserializeChunk(valCopy)
 
-				chunk := deserializeChunk(valCopy)
+			// Stop if chunk is completely past our end time.
+			if chunk.StartTime > end {
+				break
+			}
 
-				// Stop if chunk is completely past our end time
-				if chunk.StartTime > end {
-					break
-				}
+			// Use IDs from the chunk itself.
+			points := decodeChunk(chunk.SiteID, chunk.TestID, chunk)
 
-				// Use IDs from the chunk itself
-				points := decodeChunk(chunk.SiteID, chunk.TestID, chunk)
-
-				// Filter points strictly inside [start, end]
-				for _, pt := range points {
-					if pt.Timestamp >= start && pt.Timestamp <= end {
-						pointMap[pt.Timestamp] = pt
-					}
+			// Filter points strictly inside [start, end].
+			for _, pt := range points {
+				if pt.Timestamp >= start && pt.Timestamp <= end {
+					pointMap[pt.Timestamp] = pt
 				}
 			}
-			it.Close()
 		}
 		return nil
 	})
@@ -671,159 +1060,202 @@ func (e *Engine) GetTestRange(testID int64, start, end int64) ([]DataPoint, erro
 		return nil, err
 	}
 
-	// 2. Get unflushed data from memory (overrides disk data if same timestamp)
-	memoryPoints := e.getUnflushedPoints(testID, start, end)
-	for _, pt := range memoryPoints {
-		pointMap[pt.Timestamp] = pt
-	}
-
-	// 3. Convert map to sorted slice
 	results := make([]DataPoint, 0, len(pointMap))
 	for _, pt := range pointMap {
 		results = append(results, pt)
 	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Timestamp < results[j].Timestamp
+	})
+	return results, nil
+}
 
-	// Sort by timestamp
-	for i := 0; i < len(results)-1; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[i].Timestamp > results[j].Timestamp {
-				results[i], results[j] = results[j], results[i]
-			}
-		}
+func (e *Engine) GetTestRange(testID int64, start, end int64, scale string) ([]DataPoint, error) {
+	tier, windowSec, err := normalizeScale(scale)
+	if err != nil {
+		return nil, err
 	}
 
+	results, err := e.getTestRangeForTier(testID, start, end, tier)
+	if err != nil {
+		return nil, err
+	}
+
+	if tier == Scale5m {
+		// Merge unflushed memory points only for raw scale.
+		pointMap := make(map[int64]DataPoint, len(results))
+		for _, pt := range results {
+			pointMap[pt.Timestamp] = pt
+		}
+		memoryPoints := e.getUnflushedPoints(testID, start, end)
+		for _, pt := range memoryPoints {
+			pointMap[pt.Timestamp] = pt
+		}
+		merged := make([]DataPoint, 0, len(pointMap))
+		for _, pt := range pointMap {
+			merged = append(merged, pt)
+		}
+		sort.Slice(merged, func(i, j int) bool {
+			return merged[i].Timestamp < merged[j].Timestamp
+		})
+		return merged, nil
+	}
+
+	if len(results) == 0 {
+		// Backward-safe fallback while rollups are being populated.
+		raw, err := e.GetTestRange(testID, start, end, Scale5m)
+		if err != nil {
+			return nil, err
+		}
+		return aggregatePoints(raw, windowSec), nil
+	}
+
+	return aggregatePoints(results, windowSec), nil
+}
+
+func (e *Engine) getSiteTestRangeForTier(siteID, testID int64, start, end int64, tier string) ([]DataPoint, error) {
+	// Use map to deduplicate by timestamp.
+	pointMap := make(map[int64]DataPoint)
+
+	// 1. Get flushed data from disk.
+	err := e.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		prefix := []byte(fmt.Sprintf("site-%s!%016x!", tier, siteID))
+		startKey := []byte(fmt.Sprintf("site-%s!%016x!%016x!%016x", tier, siteID, start, 0))
+
+		for it.Seek(startKey); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+
+			valCopy, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+
+			chunk := deserializeChunk(valCopy)
+
+			// Stop if chunk is completely past our end time.
+			if chunk.StartTime > end {
+				break
+			}
+
+			// Skip chunks that don't match our testID.
+			if chunk.TestID != testID {
+				continue
+			}
+
+			points := decodeChunk(chunk.SiteID, chunk.TestID, chunk)
+
+			// Filter points for time range.
+			for _, pt := range points {
+				if pt.Timestamp >= start && pt.Timestamp <= end {
+					pointMap[pt.Timestamp] = pt
+				}
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]DataPoint, 0, len(pointMap))
+	for _, pt := range pointMap {
+		results = append(results, pt)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Timestamp < results[j].Timestamp
+	})
 	return results, nil
 }
 
 // GetSiteTestRange retrieves historical data for a specific test at a specific site.
-func (e *Engine) GetSiteTestRange(siteID, testID int64, start, end int64) ([]DataPoint, error) {
-	// Use map to deduplicate by timestamp (memory data overrides disk data)
-	pointMap := make(map[int64]DataPoint)
-
-	// 1. Get flushed data from disk
-	err := e.db.View(func(txn *badger.Txn) error {
-		// Smart tier selection based on query time range
-		tiers := e.selectTiersForQuery(start, end)
-
-		for _, tier := range tiers {
-			opts := badger.DefaultIteratorOptions
-			it := txn.NewIterator(opts)
-
-			prefix := []byte(fmt.Sprintf("site-%s!%016x!", tier, siteID))
-			startKey := []byte(fmt.Sprintf("site-%s!%016x!%016x!%016x", tier, siteID, start, 0))
-
-			for it.Seek(startKey); it.ValidForPrefix(prefix); it.Next() {
-				item := it.Item()
-
-				valCopy, err := item.ValueCopy(nil)
-				if err != nil {
-					it.Close()
-					return err
-				}
-
-				chunk := deserializeChunk(valCopy)
-
-				// Stop if chunk is completely past our end time
-				if chunk.StartTime > end {
-					break
-				}
-
-				// Skip chunks that don't match our testID
-				if chunk.TestID != testID {
-					continue
-				}
-
-				points := decodeChunk(chunk.SiteID, chunk.TestID, chunk)
-
-				// Filter points for time range
-				for _, pt := range points {
-					if pt.Timestamp >= start && pt.Timestamp <= end {
-						pointMap[pt.Timestamp] = pt
-					}
-				}
-			}
-			it.Close()
-		}
-		return nil
-	})
-
+func (e *Engine) GetSiteTestRange(siteID, testID int64, start, end int64, scale string) ([]DataPoint, error) {
+	tier, windowSec, err := normalizeScale(scale)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Get unflushed data from memory (overrides disk data if same timestamp)
-	memoryPoints := e.getUnflushedPointsForSite(siteID, testID, start, end)
-	for _, pt := range memoryPoints {
-		pointMap[pt.Timestamp] = pt
+	results, err := e.getSiteTestRangeForTier(siteID, testID, start, end, tier)
+	if err != nil {
+		return nil, err
 	}
 
-	// 3. Convert map to sorted slice
-	results := make([]DataPoint, 0, len(pointMap))
-	for _, pt := range pointMap {
-		results = append(results, pt)
-	}
-
-	// Sort by timestamp
-	for i := 0; i < len(results)-1; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[i].Timestamp > results[j].Timestamp {
-				results[i], results[j] = results[j], results[i]
-			}
+	if tier == Scale5m {
+		pointMap := make(map[int64]DataPoint, len(results))
+		for _, pt := range results {
+			pointMap[pt.Timestamp] = pt
 		}
+		memoryPoints := e.getUnflushedPointsForSite(siteID, testID, start, end)
+		for _, pt := range memoryPoints {
+			pointMap[pt.Timestamp] = pt
+		}
+		merged := make([]DataPoint, 0, len(pointMap))
+		for _, pt := range pointMap {
+			merged = append(merged, pt)
+		}
+		sort.Slice(merged, func(i, j int) bool {
+			return merged[i].Timestamp < merged[j].Timestamp
+		})
+		return merged, nil
 	}
 
-	return results, nil
+	if len(results) == 0 {
+		raw, err := e.GetSiteTestRange(siteID, testID, start, end, Scale5m)
+		if err != nil {
+			return nil, err
+		}
+		return aggregatePoints(raw, windowSec), nil
+	}
+
+	return aggregatePoints(results, windowSec), nil
 }
 
-// GetSiteRange retrieves historical data for all tests at a specific site.
-func (e *Engine) GetSiteRange(siteID int64, start, end int64) ([]DataPoint, error) {
-	// Use map keyed by (timestamp, testID) to deduplicate
+func (e *Engine) getSiteRangeForTier(siteID int64, start, end int64, tier string) ([]DataPoint, error) {
+	// Use map keyed by (timestamp, testID) to deduplicate.
 	type pointKey struct {
 		timestamp int64
 		testID    int64
 	}
 	pointMap := make(map[pointKey]DataPoint)
 
-	// 1. Get flushed data from disk
+	// 1. Get flushed data from disk.
 	err := e.db.View(func(txn *badger.Txn) error {
-		// Smart tier selection based on query time range
-		tiers := e.selectTiersForQuery(start, end)
+		opts := badger.DefaultIteratorOptions
+		it := txn.NewIterator(opts)
+		defer it.Close()
 
-		for _, tier := range tiers {
-			opts := badger.DefaultIteratorOptions
-			it := txn.NewIterator(opts)
+		prefix := []byte(fmt.Sprintf("site-%s!%016x!", tier, siteID))
+		startKey := []byte(fmt.Sprintf("site-%s!%016x!%016x!%016x", tier, siteID, start, 0))
 
-			prefix := []byte(fmt.Sprintf("site-%s!%016x!", tier, siteID))
-			startKey := []byte(fmt.Sprintf("site-%s!%016x!%016x!%016x", tier, siteID, start, 0))
+		for it.Seek(startKey); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
 
-			for it.Seek(startKey); it.ValidForPrefix(prefix); it.Next() {
-				item := it.Item()
+			valCopy, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
 
-				valCopy, err := item.ValueCopy(nil)
-				if err != nil {
-					it.Close()
-					return err
-				}
+			chunk := deserializeChunk(valCopy)
 
-				chunk := deserializeChunk(valCopy)
+			// Stop if chunk is completely past our end time.
+			if chunk.StartTime > end {
+				break
+			}
 
-				// Stop if chunk is completely past our end time
-				if chunk.StartTime > end {
-					break
-				}
+			// Decode using IDs from the chunk.
+			points := decodeChunk(chunk.SiteID, chunk.TestID, chunk)
 
-				// Decode using IDs from the chunk
-				points := decodeChunk(chunk.SiteID, chunk.TestID, chunk)
-
-				// Filter points strictly inside [start, end]
-				for _, pt := range points {
-					if pt.Timestamp >= start && pt.Timestamp <= end {
-						key := pointKey{timestamp: pt.Timestamp, testID: pt.TestID}
-						pointMap[key] = pt
-					}
+			// Filter points strictly inside [start, end].
+			for _, pt := range points {
+				if pt.Timestamp >= start && pt.Timestamp <= end {
+					key := pointKey{timestamp: pt.Timestamp, testID: pt.TestID}
+					pointMap[key] = pt
 				}
 			}
-			it.Close()
 		}
 		return nil
 	})
@@ -832,30 +1264,67 @@ func (e *Engine) GetSiteRange(siteID int64, start, end int64) ([]DataPoint, erro
 		return nil, err
 	}
 
-	// 2. Get unflushed data from memory (overrides disk data if same timestamp+testID)
-	memoryPoints := e.getUnflushedPointsForSiteAll(siteID, start, end)
-	for _, pt := range memoryPoints {
-		key := pointKey{timestamp: pt.Timestamp, testID: pt.TestID}
-		pointMap[key] = pt
-	}
-
-	// 3. Convert map to sorted slice
 	results := make([]DataPoint, 0, len(pointMap))
 	for _, pt := range pointMap {
 		results = append(results, pt)
 	}
 
-	// Sort by timestamp, then testID
-	for i := 0; i < len(results)-1; i++ {
-		for j := i + 1; j < len(results); j++ {
-			if results[i].Timestamp > results[j].Timestamp ||
-				(results[i].Timestamp == results[j].Timestamp && results[i].TestID > results[j].TestID) {
-				results[i], results[j] = results[j], results[i]
-			}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Timestamp != results[j].Timestamp {
+			return results[i].Timestamp < results[j].Timestamp
 		}
+		return results[i].TestID < results[j].TestID
+	})
+	return results, nil
+}
+
+// GetSiteRange retrieves historical data for all tests at a specific site.
+func (e *Engine) GetSiteRange(siteID int64, start, end int64, scale string) ([]DataPoint, error) {
+	tier, windowSec, err := normalizeScale(scale)
+	if err != nil {
+		return nil, err
 	}
 
-	return results, nil
+	results, err := e.getSiteRangeForTier(siteID, start, end, tier)
+	if err != nil {
+		return nil, err
+	}
+
+	if tier == Scale5m {
+		type pointKey struct {
+			timestamp int64
+			testID    int64
+		}
+		pointMap := make(map[pointKey]DataPoint, len(results))
+		for _, pt := range results {
+			pointMap[pointKey{timestamp: pt.Timestamp, testID: pt.TestID}] = pt
+		}
+		memoryPoints := e.getUnflushedPointsForSiteAll(siteID, start, end)
+		for _, pt := range memoryPoints {
+			pointMap[pointKey{timestamp: pt.Timestamp, testID: pt.TestID}] = pt
+		}
+		merged := make([]DataPoint, 0, len(pointMap))
+		for _, pt := range pointMap {
+			merged = append(merged, pt)
+		}
+		sort.Slice(merged, func(i, j int) bool {
+			if merged[i].Timestamp != merged[j].Timestamp {
+				return merged[i].Timestamp < merged[j].Timestamp
+			}
+			return merged[i].TestID < merged[j].TestID
+		})
+		return merged, nil
+	}
+
+	if len(results) == 0 {
+		raw, err := e.GetSiteRange(siteID, start, end, Scale5m)
+		if err != nil {
+			return nil, err
+		}
+		return aggregatePointsByTest(raw, windowSec), nil
+	}
+
+	return aggregatePointsByTest(results, windowSec), nil
 }
 
 // ============================================================================
@@ -879,37 +1348,139 @@ func (e *Engine) runChunkCompaction() {
 	}
 }
 
-// performCompaction finds and merges eligible chunks across all tiers
-func (e *Engine) performCompaction() {
-	if len(e.config.CompactionTiers) < 2 {
-		return // Need at least 2 tiers to compact
-	}
+func (e *Engine) hasRetentionConfigured() bool {
+	return e.config.Retention5m > 0 ||
+		e.config.Retention1h > 0 ||
+		e.config.Retention4h > 0 ||
+		e.config.Retention24h > 0
+}
 
-	// Compact each tier level (0->1, 1->2, etc.)
-	for i := 0; i < len(e.config.CompactionTiers)-1; i++ {
-		sourceTier := e.config.CompactionTiers[i]
-		targetTier := e.config.CompactionTiers[i+1]
-
-		e.compactTier(sourceTier, targetTier)
+func (e *Engine) retentionByScale() map[string]time.Duration {
+	return map[string]time.Duration{
+		Scale5m:  e.config.Retention5m,
+		Scale1h:  e.config.Retention1h,
+		Scale4h:  e.config.Retention4h,
+		Scale24h: e.config.Retention24h,
 	}
 }
 
-// compactTier merges chunks from sourceTier into targetTier
+func (e *Engine) runRetentionCleanup() {
+	defer e.wg.Done()
+
+	ticker := time.NewTicker(e.config.RetentionInterval)
+	defer ticker.Stop()
+
+	e.applyRetentionPolicies()
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.applyRetentionPolicies()
+		}
+	}
+}
+
+func (e *Engine) applyRetentionPolicies() {
+	for scale, retention := range e.retentionByScale() {
+		if retention <= 0 {
+			continue
+		}
+		e.deleteExpiredChunks(scale, retention)
+	}
+}
+
+func (e *Engine) deleteExpiredChunks(scale string, retention time.Duration) {
+	if retention <= 0 {
+		return
+	}
+
+	cutoff := time.Now().Add(-retention).Unix()
+	e.deleteExpiredChunksBefore(scale, cutoff)
+}
+
+func (e *Engine) deleteExpiredChunksBefore(scale string, cutoff int64) {
+	_ = e.db.Update(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		prefix := []byte(fmt.Sprintf("test-%s!", scale))
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			item := it.Item()
+			key := item.Key()
+
+			var testID, timestamp int64
+			_, err := fmt.Sscanf(string(key), "test-"+scale+"!%016x!%016x", &testID, &timestamp)
+			if err != nil {
+				continue
+			}
+			if timestamp >= cutoff {
+				continue
+			}
+
+			valCopy, err := item.ValueCopy(nil)
+			if err != nil {
+				continue
+			}
+			chunk := deserializeChunk(valCopy)
+
+			testKey := append([]byte(nil), key...)
+			siteKey := makeSiteKey(chunk.SiteID, chunk.TestID, timestamp, scale)
+
+			_ = txn.Delete(testKey)
+			_ = txn.Delete(siteKey)
+		}
+
+		return nil
+	})
+}
+
+// performCompaction computes fixed-scale rollups:
+// 5m -> 1h -> 4h -> 24h.
+func (e *Engine) performCompaction() {
+	steps := [][2]string{
+		{Scale5m, Scale1h},
+		{Scale1h, Scale4h},
+		{Scale4h, Scale24h},
+	}
+
+	for _, step := range steps {
+		sourceDur, srcOK := scaleDurations[step[0]]
+		targetDur, dstOK := scaleDurations[step[1]]
+		if !srcOK || !dstOK {
+			continue
+		}
+
+		e.compactTier(
+			CompactionTier{Name: step[0], Duration: sourceDur, MinAge: sourceDur},
+			CompactionTier{Name: step[1], Duration: targetDur, MinAge: targetDur},
+		)
+	}
+}
+
+// compactTier creates averaged points in targetTier without deleting source-tier data.
 func (e *Engine) compactTier(sourceTier, targetTier CompactionTier) {
 	err := e.db.Update(func(txn *badger.Txn) error {
-		// Track chunks to compact by (siteID, testID, target period)
-		type chunkGroup struct {
+		type rollupGroup struct {
 			siteID      int64
 			testID      int64
 			targetStart int64
-			chunks      []CompressedChunk
-			timestamps  []int64
+			sum         int64
+			count       int64
 		}
 
-		groups := make(map[string]*chunkGroup)
+		groups := make(map[string]*rollupGroup)
 		cutoffTime := time.Now().Add(-sourceTier.MinAge).Unix()
+		nowUnix := time.Now().Unix()
+		targetDurationSecs := int64(targetTier.Duration / time.Second)
+		if targetDurationSecs <= 0 {
+			targetDurationSecs = 1
+		}
 
-		// Scan all chunks in source tier
+		// Scan all chunks in source tier.
 		opts := badger.DefaultIteratorOptions
 		it := txn.NewIterator(opts)
 		defer it.Close()
@@ -919,56 +1490,68 @@ func (e *Engine) compactTier(sourceTier, targetTier CompactionTier) {
 			item := it.Item()
 			key := item.Key()
 
-			// Parse timestamp from key to check age
+			// Parse timestamp from key to check age.
 			var testID, timestamp int64
 			_, err := fmt.Sscanf(string(key), "test-"+sourceTier.Name+"!%016x!%016x", &testID, &timestamp)
 			if err != nil {
 				continue
 			}
 
-			// Only compact chunks older than cutoff
+			// Only compact chunks older than cutoff.
 			if timestamp > cutoffTime {
 				continue
 			}
 
-			// Get chunk data
+			// Get chunk data.
 			valCopy, err := item.ValueCopy(nil)
 			if err != nil {
 				continue
 			}
 
 			chunk := deserializeChunk(valCopy)
-
-			// Timestamps are second-based, so normalize target duration to whole seconds.
-			// Sub-second tiers collapse to 1 second to avoid division by zero.
-			targetDurationSecs := int64(targetTier.Duration / time.Second)
-			if targetDurationSecs <= 0 {
-				targetDurationSecs = 1
-			}
-			targetStart := (timestamp / targetDurationSecs) * targetDurationSecs
-			groupKey := fmt.Sprintf("%d:%d:%d", chunk.SiteID, chunk.TestID, targetStart)
-
-			if _, exists := groups[groupKey]; !exists {
-				groups[groupKey] = &chunkGroup{
-					siteID:      chunk.SiteID,
-					testID:      chunk.TestID,
-					targetStart: targetStart,
+			points := decodeChunk(chunk.SiteID, chunk.TestID, chunk)
+			for _, pt := range points {
+				targetStart := floorToWindow(pt.Timestamp, targetDurationSecs)
+				// Only roll up fully closed windows.
+				if targetStart+targetDurationSecs > nowUnix {
+					continue
 				}
+
+				groupKey := fmt.Sprintf("%d:%d:%d", chunk.SiteID, chunk.TestID, targetStart)
+				group, exists := groups[groupKey]
+				if !exists {
+					group = &rollupGroup{
+						siteID:      chunk.SiteID,
+						testID:      chunk.TestID,
+						targetStart: targetStart,
+					}
+					groups[groupKey] = group
+				}
+				group.sum += pt.Value
+				group.count++
 			}
-			groups[groupKey].chunks = append(groups[groupKey].chunks, chunk)
-			groups[groupKey].timestamps = append(groups[groupKey].timestamps, timestamp)
 		}
 
-		// Merge and write target tier chunks
+		// Write averaged target-tier chunks.
 		for _, group := range groups {
-			if len(group.chunks) == 0 {
+			if group.count == 0 {
 				continue
 			}
+			avg := group.sum / group.count
+			rolled := CompressedChunk{
+				SiteID:          group.siteID,
+				TestID:          group.testID,
+				StartTime:       group.targetStart,
+				Interval:        targetTier.Duration,
+				Count:           1,
+				FirstVal:        avg,
+				LastVal:         avg,
+				CompressionType: CompressionSnappy,
+			}
+			rolled.EndTime = group.targetStart + targetDurationSecs
+			rolled.Data = encodeValuesOptimized([]int64{avg}, avg)
 
-			merged := e.mergeChunks(group.chunks, group.targetStart)
-
-			// Write target tier chunk
-			chunkBytes := serializeChunk(merged)
+			chunkBytes := serializeChunk(rolled)
 			testKey := makeTestKey(group.testID, group.targetStart, targetTier.Name)
 			siteKey := makeSiteKey(group.siteID, group.testID, group.targetStart, targetTier.Name)
 
@@ -977,14 +1560,6 @@ func (e *Engine) compactTier(sourceTier, targetTier CompactionTier) {
 			}
 			if err := txn.Set(siteKey, chunkBytes); err != nil {
 				continue
-			}
-
-			// Delete old source tier chunks
-			for _, ts := range group.timestamps {
-				testKey := makeTestKey(group.testID, ts, sourceTier.Name)
-				siteKey := makeSiteKey(group.siteID, group.testID, ts, sourceTier.Name)
-				txn.Delete(testKey)
-				txn.Delete(siteKey)
 			}
 		}
 
@@ -995,50 +1570,6 @@ func (e *Engine) compactTier(sourceTier, targetTier CompactionTier) {
 		// In production, log this error
 		_ = err
 	}
-}
-
-// mergeChunks combines multiple chunks into a single larger chunk
-func (e *Engine) mergeChunks(chunks []CompressedChunk, newStartTime int64) CompressedChunk {
-	if len(chunks) == 0 {
-		return CompressedChunk{}
-	}
-
-	// Collect all values from all chunks
-	var allValues []int64
-
-	for _, chunk := range chunks {
-		// Decode the chunk using optimized decoder
-		values := decodeValuesOptimized(chunk.Data, chunk.FirstVal, int(chunk.Count), chunk.CompressionType)
-		allValues = append(allValues, values...)
-	}
-
-	if len(allValues) == 0 {
-		return CompressedChunk{}
-	}
-
-	intervalSecs := int64(chunks[0].Interval.Seconds())
-	if intervalSecs == 0 {
-		intervalSecs = 1
-	}
-
-	// Create merged chunk
-	merged := CompressedChunk{
-		SiteID:          chunks[0].SiteID,
-		TestID:          chunks[0].TestID,
-		StartTime:       newStartTime,
-		Interval:        chunks[0].Interval,
-		Count:           uint32(len(allValues)),
-		FirstVal:        allValues[0],
-		LastVal:         allValues[len(allValues)-1],
-		CompressionType: CompressionSnappy,
-	}
-
-	merged.EndTime = newStartTime + (int64(len(allValues)) * intervalSecs)
-
-	// Encode using optimized encoding
-	merged.Data = encodeValuesOptimized(allValues, merged.FirstVal)
-
-	return merged
 }
 
 // ============================================================================
@@ -1148,7 +1679,7 @@ func decodeValuesOptimized(data []byte, firstVal int64, count int, compressionTy
 // getTierNames returns all tier names in order (first tier first)
 func (e *Engine) getTierNames() []string {
 	if len(e.config.CompactionTiers) == 0 {
-		return []string{"raw"}
+		return []string{Scale5m, Scale1h, Scale4h, Scale24h}
 	}
 
 	names := make([]string, len(e.config.CompactionTiers))
@@ -1161,7 +1692,7 @@ func (e *Engine) getTierNames() []string {
 // selectTiersForQuery returns only tiers that could contain data in the given time range
 func (e *Engine) selectTiersForQuery(start, end int64) []string {
 	if len(e.config.CompactionTiers) == 0 {
-		return []string{"raw"}
+		return []string{Scale5m, Scale1h, Scale4h, Scale24h}
 	}
 
 	now := time.Now().Unix()

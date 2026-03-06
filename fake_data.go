@@ -86,6 +86,13 @@ func (e *Engine) GenerateFakeDataRange(siteIDs []int64, probeIDs []ProbeWithSite
 		}
 	}
 
+	// Materialize raw buckets and generate rollup scales so fake data is
+	// immediately available in 5m/1h/4h/24h collections.
+	e.flushActiveBuckets()
+	_ = e.waitPipelinesQuiet(5 * time.Second)
+	_ = e.flushWriterNow(2 * time.Second)
+	e.performCompaction()
+
 	return total, nil
 }
 

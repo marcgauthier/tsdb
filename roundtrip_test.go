@@ -63,7 +63,7 @@ func TestRoundTripPersistedQueryReturnsWrittenPoints(t *testing.T) {
 		engine.Start()
 		defer engine.Stop()
 
-		results, err := engine.GetSiteTestRange(siteID, testID, start, start+4)
+		results, err := engine.GetSiteTestRange(siteID, testID, start, start+4, Scale5m)
 		if err != nil {
 			t.Fatalf("Query failed: %v", err)
 		}

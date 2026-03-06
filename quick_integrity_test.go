@@ -11,8 +11,8 @@ func TestQuickIntegrityCheck(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfg := Config{
 		DBPath:             filepath.Join(tmpDir, "test.db"),
-		ChunkFlushInterval: 10 * time.Second,  // Long enough for all test data
-		IntervalResolution: 1 * time.Second,    // 1-second intervals
+		ChunkFlushInterval: 10 * time.Second, // Long enough for all test data
+		IntervalResolution: 1 * time.Second,  // 1-second intervals
 		IngestBufferSize:   10000,
 		CompactorWorkers:   2,
 		CompactionTiers: []CompactionTier{
@@ -49,8 +49,8 @@ func TestQuickIntegrityCheck(t *testing.T) {
 
 		time.Sleep(2 * time.Second) // Wait for flush
 
-		results, _ := engine.GetTestRange(5001, now, now+10)
-		
+		results, _ := engine.GetTestRange(5001, now, now+10, Scale5m)
+
 		if len(results) == 0 {
 			t.Error("  ❌ No results returned")
 		} else {
@@ -76,7 +76,7 @@ func TestQuickIntegrityCheck(t *testing.T) {
 	{
 		fmt.Println("\n[2] Series Isolation Test")
 		now := time.Now().Unix()
-		
+
 		// Write to different series
 		for i := 0; i < 10; i++ {
 			engine.Add(now+int64(i), 100, 5001, 1000+int64(i))
@@ -87,12 +87,12 @@ func TestQuickIntegrityCheck(t *testing.T) {
 		time.Sleep(2 * time.Second)
 
 		// Query each series
-		series1, _ := engine.GetSiteTestRange(100, 5001, now, now+10)
-		series2, _ := engine.GetSiteTestRange(100, 5002, now, now+10)
-		series3, _ := engine.GetSiteTestRange(101, 5001, now, now+10)
+		series1, _ := engine.GetSiteTestRange(100, 5001, now, now+10, Scale5m)
+		series2, _ := engine.GetSiteTestRange(100, 5002, now, now+10, Scale5m)
+		series3, _ := engine.GetSiteTestRange(101, 5001, now, now+10, Scale5m)
 
 		errors := 0
-		
+
 		// Verify series1 has only its values (1000-1009)
 		for _, pt := range series1 {
 			if pt.Value < 1000 || pt.Value > 1009 {
@@ -126,7 +126,7 @@ func TestQuickIntegrityCheck(t *testing.T) {
 	{
 		fmt.Println("\n[3] Extreme Values Test")
 		now := time.Now().Unix()
-		
+
 		extremes := []int64{
 			0,
 			-1000,
@@ -140,7 +140,7 @@ func TestQuickIntegrityCheck(t *testing.T) {
 
 		time.Sleep(2 * time.Second)
 
-		results, _ := engine.GetTestRange(5003, now, now+10)
+		results, _ := engine.GetTestRange(5003, now, now+10, Scale5m)
 		foundValues := make(map[int64]bool)
 		for _, pt := range results {
 			foundValues[pt.Value] = true
@@ -179,8 +179,8 @@ func TestQuickIntegrityCheck(t *testing.T) {
 		engine2.Start()
 		defer engine2.Stop()
 
-		results, _ := engine2.GetTestRange(5004, now, now+30)
-		
+		results, _ := engine2.GetTestRange(5004, now, now+30, Scale5m)
+
 		if len(results) == 0 {
 			t.Error("  ❌ No data persisted")
 		} else {

@@ -53,7 +53,7 @@ func TestDataIntegrity_BasicWriteRead(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Read back and verify
-	results, err := engine.GetTestRange(5001, 1000, 1005)
+	results, err := engine.GetTestRange(5001, 1000, 1005, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestDataIntegrity_LargeDataset(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// Read back all data
-	results, err := engine.GetTestRange(5001, startTime, startTime+int64(count))
+	results, err := engine.GetTestRange(5001, startTime, startTime+int64(count), Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestDataIntegrity_Persistence(t *testing.T) {
 		engine.Start()
 		defer engine.Stop()
 
-		results, err := engine.GetTestRange(6001, 2000, 2100)
+		results, err := engine.GetTestRange(6001, 2000, 2100, Scale5m)
 		if err != nil {
 			t.Fatalf("Query after restart failed: %v", err)
 		}
@@ -263,7 +263,7 @@ func TestDataIntegrity_ForwardFillCorrectness(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Query the chunk
-	results, err := engine.GetTestRange(5001, startTime, startTime+1)
+	results, err := engine.GetTestRange(5001, startTime, startTime+1, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestDataIntegrity_MultipleSeriesIsolation(t *testing.T) {
 
 	// Verify each series independently
 	for _, s := range series {
-		results, err := engine.GetSiteTestRange(s.siteID, s.testID, startTime, startTime+10)
+		results, err := engine.GetSiteTestRange(s.siteID, s.testID, startTime, startTime+10, Scale5m)
 		if err != nil {
 			t.Fatalf("Query failed for site %d test %d: %v", s.siteID, s.testID, err)
 		}
@@ -407,7 +407,7 @@ func TestDataIntegrity_ExtremeValues(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Read back and verify
-	results, err := engine.GetTestRange(5001, startTime, startTime+10)
+	results, err := engine.GetTestRange(5001, startTime, startTime+10, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -477,7 +477,7 @@ func TestDataIntegrity_CompressionFidelity(t *testing.T) {
 	// Verify each pattern
 	offset = int64(0)
 	for _, pattern := range patterns {
-		results, err := engine.GetTestRange(5001, startTime+offset, startTime+offset+10)
+		results, err := engine.GetTestRange(5001, startTime+offset, startTime+offset+10, Scale5m)
 		if err != nil {
 			t.Fatalf("Query failed for pattern '%s': %v", pattern.name, err)
 		}

@@ -65,7 +65,7 @@ func TestVerifyCoreFunctionality(t *testing.T) {
 
 	// Historical query
 	fmt.Println("Querying for testID=5001, range [999, 1001]...")
-	results, err := engine.GetTestRange(5001, 999, 1001)
+	results, err := engine.GetTestRange(5001, 999, 1001, Scale5m)
 	if err != nil {
 		t.Fatalf("Historical query error: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestVerifyCoreFunctionality(t *testing.T) {
 	})
 	fmt.Printf("Database has %d test keys\n", keyCount2)
 
-	results2, err := engine.GetTestRange(5002, 2000, 2004)
+	results2, err := engine.GetTestRange(5002, 2000, 2004, Scale5m)
 	if err != nil {
 		t.Fatalf("Query error: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestVerifyCoreFunctionality(t *testing.T) {
 	engine2.Start()
 	defer engine2.Stop()
 
-	results3, err := engine2.GetTestRange(5001, 999, 1001)
+	results3, err := engine2.GetTestRange(5001, 999, 1001, Scale5m)
 	if err != nil {
 		t.Fatalf("Query after restart error: %v", err)
 	}

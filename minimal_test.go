@@ -67,7 +67,7 @@ func TestMinimalWriteRead(t *testing.T) {
 
 	// Try range query
 	fmt.Println("\nTrying range query...")
-	results, err := engine.GetTestRange(5001, timestamp-5, timestamp+5)
+	results, err := engine.GetTestRange(5001, timestamp-5, timestamp+5, Scale5m)
 	if err != nil {
 		fmt.Printf("  Query error: %v\n", err)
 	} else {

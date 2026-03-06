@@ -14,7 +14,7 @@ func setupTestEngine(t *testing.T) (*Engine, func()) {
 
 	cfg := Config{
 		DBPath:             filepath.Join(tmpDir, "test.db"),
-		ChunkFlushInterval: 1 * time.Second,   // Flush every second
+		ChunkFlushInterval: 1 * time.Second,        // Flush every second
 		IntervalResolution: 100 * time.Millisecond, // 100ms intervals
 		IngestBufferSize:   1000,
 		CompactorWorkers:   2,
@@ -131,7 +131,7 @@ func TestForwardFill(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Query historical data
-	results, err := engine.GetTestRange(testID, now, now+10)
+	results, err := engine.GetTestRange(testID, now, now+10, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestHistoricalQueries(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Query a subset
-	results, err := engine.GetTestRange(testID, now+3, now+7)
+	results, err := engine.GetTestRange(testID, now+3, now+7, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestSiteQueries(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Query all tests at site
-	results, err := engine.GetSiteRange(siteID, now, now+10)
+	results, err := engine.GetSiteRange(siteID, now, now+10, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestSiteTestQuery(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Query specific test at site
-	results, err := engine.GetSiteTestRange(siteID, targetTestID, now, now+10)
+	results, err := engine.GetSiteTestRange(siteID, targetTestID, now, now+10, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -421,7 +421,7 @@ func TestMultiTierCompaction(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Verify we can still query the data
-	results, err := engine.GetTestRange(testID, now, now+50)
+	results, err := engine.GetTestRange(testID, now, now+50, Scale5m)
 	if err != nil {
 		t.Fatalf("Query after compaction failed: %v", err)
 	}
@@ -492,7 +492,7 @@ func TestEmptyResults(t *testing.T) {
 	engine.Start()
 
 	// Query non-existent data
-	results, err := engine.GetTestRange(99999, 0, 100)
+	results, err := engine.GetTestRange(99999, 0, 100, Scale5m)
 	if err != nil {
 		t.Fatalf("Query failed: %v", err)
 	}
@@ -600,7 +600,7 @@ func BenchmarkQuery(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = engine.GetTestRange(5001, now, now+1000)
+		_, _ = engine.GetTestRange(5001, now, now+1000, Scale5m)
 	}
 }
 

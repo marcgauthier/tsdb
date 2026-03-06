@@ -16,7 +16,7 @@ func TestDataIntegrity_Verified(t *testing.T) {
 	// Test 1: Basic Write/Read with forced flush
 	{
 		fmt.Println("\n[1] Basic Write/Read")
-		
+
 		cfg := Config{
 			DBPath:             dbPath,
 			ChunkFlushInterval: 500 * time.Millisecond,
@@ -47,10 +47,10 @@ func TestDataIntegrity_Verified(t *testing.T) {
 
 		// Wait for at least one flush cycle
 		time.Sleep(1500 * time.Millisecond)
-		
+
 		// Query
-		results, _ := engine.GetTestRange(5001, 9990, 10010)
-		
+		results, _ := engine.GetTestRange(5001, 9990, 10010, Scale5m)
+
 		engine.Stop()
 
 		if len(results) == 0 {
@@ -74,7 +74,7 @@ func TestDataIntegrity_Verified(t *testing.T) {
 	// Test 2: Persistence across restart
 	{
 		fmt.Println("\n[2] Persistence Across Restart")
-		
+
 		cfg := Config{
 			DBPath:             dbPath,
 			ChunkFlushInterval: 500 * time.Millisecond,
@@ -106,7 +106,7 @@ func TestDataIntegrity_Verified(t *testing.T) {
 			engine, _ := NewEngine(cfg)
 			engine.Start()
 
-			results, _ := engine.GetTestRange(5002, 20000, 20050)
+			results, _ := engine.GetTestRange(5002, 20000, 20050, Scale5m)
 			engine.Stop()
 
 			if len(results) == 0 {
@@ -132,7 +132,7 @@ func TestDataIntegrity_Verified(t *testing.T) {
 	// Test 3: Large dataset integrity
 	{
 		fmt.Println("\n[3] Large Dataset (1000 points)")
-		
+
 		cfg := Config{
 			DBPath:             dbPath + "3",
 			ChunkFlushInterval: 500 * time.Millisecond,
@@ -151,7 +151,7 @@ func TestDataIntegrity_Verified(t *testing.T) {
 
 		expected := make(map[int64]int64)
 		startTs := int64(30000)
-		
+
 		for i := 0; i < 1000; i++ {
 			ts := startTs + int64(i/10) // Group into chunks
 			val := int64(5000 + i)
@@ -160,8 +160,8 @@ func TestDataIntegrity_Verified(t *testing.T) {
 		}
 
 		time.Sleep(2 * time.Second)
-		
-		results, _ := engine.GetTestRange(5003, startTs-10, startTs+200)
+
+		results, _ := engine.GetTestRange(5003, startTs-10, startTs+200, Scale5m)
 		engine.Stop()
 
 		if len(results) == 0 {
@@ -181,7 +181,7 @@ func TestDataIntegrity_Verified(t *testing.T) {
 					checked++
 				}
 			}
-			
+
 			if errors == 0 {
 				fmt.Printf("  ✓ 1000 values written, %d verified\n", checked)
 			} else {
@@ -193,7 +193,7 @@ func TestDataIntegrity_Verified(t *testing.T) {
 	// Test 4: Extreme values
 	{
 		fmt.Println("\n[4] Extreme Values")
-		
+
 		cfg := Config{
 			DBPath:             dbPath + "4",
 			ChunkFlushInterval: 500 * time.Millisecond,
@@ -224,8 +224,8 @@ func TestDataIntegrity_Verified(t *testing.T) {
 		}
 
 		time.Sleep(1500 * time.Millisecond)
-		
-		results, _ := engine.GetTestRange(5004, 39990, 40010)
+
+		results, _ := engine.GetTestRange(5004, 39990, 40010, Scale5m)
 		engine.Stop()
 
 		if len(results) == 0 {

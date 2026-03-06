@@ -2,11 +2,11 @@ package tsdb
 
 import (
 	"fmt"
+	"github.com/dgraph-io/badger/v4"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"github.com/dgraph-io/badger/v4"
 	"testing"
 	"time"
 )
@@ -53,7 +53,7 @@ func TestRealisticDiskThroughput(t *testing.T) {
 
 		elapsed := time.Since(start)
 		rate := float64(count) / elapsed.Seconds()
-		fmt.Printf("  Rate: %10.0f inserts/sec (%d inserts in %v)\n", 
+		fmt.Printf("  Rate: %10.0f inserts/sec (%d inserts in %v)\n",
 			rate, count, elapsed.Round(time.Millisecond))
 	}
 
