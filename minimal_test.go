@@ -56,13 +56,15 @@ func TestMinimalWriteRead(t *testing.T) {
 	})
 	fmt.Printf("Keys in database: %d\n", keyCount)
 
-	// Try real-time query
-	fmt.Println("\nTrying real-time query...")
-	pt, exists := engine.GetLatestTest(100, 5001)
-	if exists {
-		fmt.Printf("  Real-time: value=%d ✓\n", pt.Value)
+	// Try recent range query (includes in-memory data)
+	fmt.Println("\nTrying recent range query...")
+	resultsNow, err := engine.GetSiteTestRange(100, 5001, timestamp, timestamp, Scale5m)
+	if err != nil {
+		fmt.Printf("  Recent range error: %v\n", err)
+	} else if len(resultsNow) > 0 {
+		fmt.Printf("  Recent range: value=%d ✓\n", resultsNow[len(resultsNow)-1].Value)
 	} else {
-		fmt.Println("  Real-time: not found ❌")
+		fmt.Println("  Recent range: not found ❌")
 	}
 
 	// Try range query

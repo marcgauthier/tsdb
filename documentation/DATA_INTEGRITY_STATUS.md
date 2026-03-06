@@ -5,8 +5,7 @@ This document reflects the current engine behavior in `main.go` and `fake_data.g
 ## Current Guarantees
 
 ### 1. Ingestion visibility
-- `Add(timestamp, siteID, testID, value)` updates in-memory latest state immediately.
-- The same call also updates active in-memory buckets for historical queries.
+- `Add(timestamp, siteID, testID, value)` updates active in-memory buckets immediately.
 - For the same `(siteID, testID, time-slot)`, last write wins.
 
 ### 2. Disk persistence model

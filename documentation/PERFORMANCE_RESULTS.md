@@ -7,7 +7,7 @@ This file documents how to measure performance for the current engine. Older his
 Measure these separately:
 1. Ingestion-only (`Add` path and raw `5m` persistence).
 2. End-to-end ingestion with rollups (`5m -> 1h -> 4h -> 24h`).
-3. Mixed read/write workloads (`GetLatest*` and historical `Get*Range`).
+3. Mixed read/write workloads (historical `Get*Range` while writing).
 
 ## Current Default-Relevant Settings
 

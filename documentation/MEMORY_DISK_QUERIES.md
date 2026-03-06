@@ -1,6 +1,6 @@
 # Memory + Disk Query Semantics
 
-This document describes how historical and real-time queries work in the current engine.
+This document describes how historical queries combine memory and disk in the current engine.
 
 ## Historical API Signatures
 
@@ -15,13 +15,6 @@ Valid scales:
 - `Scale24h`
 
 If `scale == ""`, it defaults to `Scale5m`.
-
-## Real-Time APIs
-
-- `GetLatestTest(siteID, testID int64) (DataPoint, bool)`
-- `GetLatestSite(siteID int64) map[int64]DataPoint`
-
-These read only from in-memory latest-state mirrors.
 
 ## Historical Read Path by Scale
 
@@ -76,6 +69,6 @@ _ = siteDaily
 
 ## Timing Notes
 
-- Data written by `Add()` is immediately visible to real-time queries.
+- Data written by `Add()` is immediately visible to `Scale5m` historical queries.
 - For historical queries, `5m` includes in-memory points before disk flush.
 - Rollup tiers become available after compaction has processed closed source windows.

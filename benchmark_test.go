@@ -274,9 +274,9 @@ func BenchmarkRealTimeQueryWhileWriting(b *testing.B) {
 	b.ResetTimer()
 	start := time.Now()
 
-	// Benchmark real-time queries
+	// Benchmark short-range queries while writes are in flight.
 	for i := 0; i < b.N; i++ {
-		_, _ = engine.GetLatestTest(100, 5001)
+		_, _ = engine.GetSiteTestRange(100, 5001, now, now+1, Scale5m)
 	}
 
 	elapsed := time.Since(start)
@@ -286,7 +286,7 @@ func BenchmarkRealTimeQueryWhileWriting(b *testing.B) {
 	writeRate := float64(atomic.LoadInt64(&writeCounter)) / elapsed.Seconds()
 
 	b.ReportMetric(queryRate, "queries/sec")
-	b.Logf("Real-time queries: %.0f queries/sec while writing at %.0f inserts/sec",
+	b.Logf("Short-range queries: %.0f queries/sec while writing at %.0f inserts/sec",
 		queryRate, writeRate)
 }
 
@@ -421,12 +421,12 @@ func TestThroughputReport(t *testing.T) {
 		start := time.Now()
 
 		for i := 0; i < count; i++ {
-			_, _ = engine.GetLatestTest(400, 8001)
+			_, _ = engine.GetSiteTestRange(400, 8001, now, now+999, Scale5m)
 		}
 
 		elapsed := time.Since(start)
 		rate := float64(count) / elapsed.Seconds()
-		fmt.Printf("Real-time query rate:      %10.0f queries/sec\n", rate)
+		fmt.Printf("Historical query rate:     %10.0f queries/sec\n", rate)
 	}
 
 	fmt.Println("\n=== Configuration ===")

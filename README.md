@@ -2,7 +2,7 @@
 
 A pipeline-based time-series engine in Go backed by [BadgerDB](https://github.com/dgraph-io/badger).
 
-The engine keeps latest values in memory for real-time reads and stores historical chunks on disk. It supports fixed query scales:
+The engine stores historical chunks on disk and merges in-memory unflushed data for raw-range queries. It supports fixed query scales:
 - `5m` (raw)
 - `1h` (rollup average)
 - `4h` (rollup average)
@@ -11,17 +11,15 @@ The engine keeps latest values in memory for real-time reads and stores historic
 ## Overview
 
 Write path:
-1. `Add()` updates in-memory latest state immediately.
-2. `Add()` also writes into active in-memory buckets (slot-based, last-write-wins per slot).
-3. `runPacker` periodically seals active buckets and sends them to compaction/encoding workers.
-4. `runWriter` batches compressed chunks into Badger.
+1. `Add()` writes into active in-memory buckets (slot-based, last-write-wins per slot).
+2. `runPacker` periodically seals active buckets and sends them to compaction/encoding workers.
+3. `runWriter` batches compressed chunks into Badger.
 
 Rollup path:
 - `performCompaction()` builds fixed rollups: `5m -> 1h -> 4h -> 24h`.
 - Source-tier data is preserved (rollups do not delete lower tiers).
 
 Read path:
-- Real-time APIs read from in-memory state.
 - Historical APIs read Badger and merge in-memory unflushed points for `5m` queries.
 - If a non-`5m` tier has no data yet, queries fall back to `5m` and aggregate in memory.
 
@@ -104,10 +102,6 @@ Engine lifecycle:
 
 Ingestion:
 - `Add(timestamp, siteID, testID, value int64)`
-
-Real-time reads:
-- `GetLatestTest(siteID, testID int64) (DataPoint, bool)`
-- `GetLatestSite(siteID int64) map[int64]DataPoint`
 
 Historical reads:
 - `GetTestRange(testID, start, end int64, scale string) ([]DataPoint, error)`

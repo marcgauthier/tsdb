@@ -39,7 +39,7 @@ func setupTestEngine(t *testing.T) (*Engine, func()) {
 	return engine, cleanup
 }
 
-// Test basic ingestion and real-time queries
+// Test basic ingestion and recent visibility through range queries.
 func TestBasicIngestion(t *testing.T) {
 	engine, cleanup := setupTestEngine(t)
 	defer cleanup()
@@ -55,30 +55,28 @@ func TestBasicIngestion(t *testing.T) {
 	engine.Add(now+1, siteID, testID, 105)
 	engine.Add(now+2, siteID, testID, 110)
 
-	// Small delay to ensure data is processed
-	time.Sleep(100 * time.Millisecond)
-
-	// Check real-time data
-	point, exists := engine.GetLatestTest(siteID, testID)
-	if !exists {
-		t.Fatal("Expected data point to exist")
+	results, err := engine.GetSiteTestRange(siteID, testID, now, now+2, Scale5m)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if len(results) == 0 {
+		t.Fatal("Expected data points to exist")
 	}
 
-	if point.Value != 110 {
-		t.Errorf("Expected value 110, got %d", point.Value)
+	last := results[len(results)-1]
+	if last.Value != 110 {
+		t.Errorf("Expected latest value 110, got %d", last.Value)
 	}
-
-	if point.SiteID != siteID {
-		t.Errorf("Expected siteID %d, got %d", siteID, point.SiteID)
+	if last.SiteID != siteID {
+		t.Errorf("Expected siteID %d, got %d", siteID, last.SiteID)
 	}
-
-	if point.TestID != testID {
-		t.Errorf("Expected testID %d, got %d", testID, point.TestID)
+	if last.TestID != testID {
+		t.Errorf("Expected testID %d, got %d", testID, last.TestID)
 	}
 }
 
-// Test GetLatestSite
-func TestGetLatestSite(t *testing.T) {
+// Test range query for all tests at a site.
+func TestGetSiteRange_AllTestsVisible(t *testing.T) {
 	engine, cleanup := setupTestEngine(t)
 	defer cleanup()
 
@@ -92,23 +90,26 @@ func TestGetLatestSite(t *testing.T) {
 	engine.Add(now, siteID, 5002, 200)
 	engine.Add(now, siteID, 5003, 300)
 
-	time.Sleep(100 * time.Millisecond)
-
-	// Get all tests for site
-	siteData := engine.GetLatestSite(siteID)
-
+	siteData, err := engine.GetSiteRange(siteID, now, now, Scale5m)
+	if err != nil {
+		t.Fatalf("site range query failed: %v", err)
+	}
 	if len(siteData) != 3 {
-		t.Errorf("Expected 3 tests, got %d", len(siteData))
+		t.Errorf("Expected 3 points, got %d", len(siteData))
 	}
 
-	if siteData[5001].Value != 100 {
-		t.Errorf("Expected test 5001 value 100, got %d", siteData[5001].Value)
+	got := map[int64]int64{}
+	for _, pt := range siteData {
+		got[pt.TestID] = pt.Value
 	}
-	if siteData[5002].Value != 200 {
-		t.Errorf("Expected test 5002 value 200, got %d", siteData[5002].Value)
+	if got[5001] != 100 {
+		t.Errorf("Expected test 5001 value 100, got %d", got[5001])
 	}
-	if siteData[5003].Value != 300 {
-		t.Errorf("Expected test 5003 value 300, got %d", siteData[5003].Value)
+	if got[5002] != 200 {
+		t.Errorf("Expected test 5002 value 200, got %d", got[5002])
+	}
+	if got[5003] != 300 {
+		t.Errorf("Expected test 5003 value 300, got %d", got[5003])
 	}
 }
 
@@ -360,21 +361,24 @@ func TestConcurrentIngestion(t *testing.T) {
 		<-done
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
 	// Verify data for each goroutine
 	for g := 0; g < 10; g++ {
 		siteID := int64(100 + g)
 		testID := int64(5000 + g)
 
-		point, exists := engine.GetLatestTest(siteID, testID)
-		if !exists {
+		results, err := engine.GetSiteTestRange(siteID, testID, now, now+99, Scale5m)
+		if err != nil {
+			t.Errorf("Goroutine %d: query failed: %v", g, err)
+			continue
+		}
+		if len(results) == 0 {
 			t.Errorf("Goroutine %d: expected data to exist", g)
 			continue
 		}
 
-		if point.Value != 99 {
-			t.Errorf("Goroutine %d: expected value 99, got %d", g, point.Value)
+		last := results[len(results)-1]
+		if last.Value != 99 {
+			t.Errorf("Goroutine %d: expected value 99, got %d", g, last.Value)
 		}
 	}
 }
@@ -501,10 +505,12 @@ func TestEmptyResults(t *testing.T) {
 		t.Errorf("Expected empty results, got %d points", len(results))
 	}
 
-	// GetLatestTest for non-existent data
-	_, exists := engine.GetLatestTest(99999, 99999)
-	if exists {
-		t.Error("Expected data to not exist")
+	siteResults, err := engine.GetSiteTestRange(99999, 99999, 0, 100, Scale5m)
+	if err != nil {
+		t.Fatalf("Site test query failed: %v", err)
+	}
+	if len(siteResults) != 0 {
+		t.Errorf("Expected empty site/test results, got %d points", len(siteResults))
 	}
 }
 
@@ -521,15 +527,15 @@ func TestSingleDataPoint(t *testing.T) {
 
 	engine.Add(now, siteID, testID, 42)
 
-	time.Sleep(100 * time.Millisecond)
-
-	point, exists := engine.GetLatestTest(siteID, testID)
-	if !exists {
-		t.Fatal("Expected single point to exist")
+	results, err := engine.GetSiteTestRange(siteID, testID, now, now, Scale5m)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
 	}
-
-	if point.Value != 42 {
-		t.Errorf("Expected value 42, got %d", point.Value)
+	if len(results) != 1 {
+		t.Fatalf("Expected 1 point, got %d", len(results))
+	}
+	if results[0].Value != 42 {
+		t.Errorf("Expected value 42, got %d", results[0].Value)
 	}
 }
 

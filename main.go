@@ -106,11 +106,6 @@ type pendingBucket struct {
 	expiresAt time.Time
 }
 
-type stateShard struct {
-	mu     sync.RWMutex
-	values map[int64]map[int64]DataPoint // map[SiteID]map[TestID]DataPoint
-}
-
 type bucketShard struct {
 	mu      sync.RWMutex
 	buckets map[bucketKey]*bucketAccumulator
@@ -142,7 +137,6 @@ type Config struct {
 }
 
 const (
-	stateShardCount  = 64
 	bucketShardCount = 64
 )
 
@@ -159,9 +153,6 @@ type Engine struct {
 	chunkChan      chan RawBucket
 	writeChan      chan WritePayload
 	writerFlushReq chan chan struct{}
-
-	// Real-Time State Keeper
-	stateShards []stateShard
 
 	// Unflushed Data (for memory+disk queries)
 	activeShards   []bucketShard
@@ -256,11 +247,6 @@ func NewEngine(cfg Config) (*Engine, error) {
 		slotCount = 1
 	}
 
-	stateShards := make([]stateShard, stateShardCount)
-	for i := range stateShards {
-		stateShards[i] = stateShard{values: make(map[int64]map[int64]DataPoint)}
-	}
-
 	activeShards := make([]bucketShard, bucketShardCount)
 	for i := range activeShards {
 		activeShards[i] = bucketShard{buckets: make(map[bucketKey]*bucketAccumulator)}
@@ -273,7 +259,6 @@ func NewEngine(cfg Config) (*Engine, error) {
 		chunkChan:        make(chan RawBucket, cfg.IngestBufferSize/10),
 		writeChan:        make(chan WritePayload, cfg.IngestBufferSize/10),
 		writerFlushReq:   make(chan chan struct{}, 1),
-		stateShards:      stateShards,
 		activeShards:     activeShards,
 		pendingBuckets:   make(map[bucketKey]pendingBucket),
 		slotCount:        slotCount,
@@ -357,14 +342,6 @@ func (e *Engine) Stop() error {
 	})
 
 	return e.stopErr
-}
-
-func stateShardIndex(siteID int64) int {
-	u := uint64(siteID)
-	u ^= u >> 33
-	u *= 0xff51afd7ed558ccd
-	u ^= u >> 33
-	return int(u % stateShardCount)
 }
 
 func bucketShardIndex(key bucketKey) int {
@@ -536,16 +513,6 @@ func (e *Engine) Add(timestamp, siteID, testID, value int64) {
 		Value:     value,
 	}
 
-	// Update real-time mirror synchronously for immediate query visibility.
-	stateIdx := stateShardIndex(pt.SiteID)
-	stateShard := &e.stateShards[stateIdx]
-	stateShard.mu.Lock()
-	if _, exists := stateShard.values[pt.SiteID]; !exists {
-		stateShard.values[pt.SiteID] = make(map[int64]DataPoint)
-	}
-	stateShard.values[pt.SiteID][pt.TestID] = pt
-	stateShard.mu.Unlock()
-
 	// Add to active bucket synchronously to avoid ingestion/query races.
 	flushIntervalSecs := int64(e.config.ChunkFlushInterval.Seconds())
 	if flushIntervalSecs <= 0 {
@@ -582,7 +549,7 @@ func (e *Engine) Add(timestamp, siteID, testID, value int64) {
 // Pipeline Goroutines
 // ============================================================================
 
-// runPacker reads individual points, updates the real-time map, and buckets them.
+// runPacker periodically seals active buckets and forwards them to compactor workers.
 func (e *Engine) runPacker() {
 	defer e.wg.Done()
 	defer close(e.chunkChan) // Close output channel when done
@@ -765,37 +732,6 @@ func (e *Engine) runWriter() {
 			}
 		}
 	}
-}
-
-// ============================================================================
-// Public API: Real-Time Queries (O(1) Map Lookups)
-// ============================================================================
-
-func (e *Engine) GetLatestTest(siteID, testID int64) (DataPoint, bool) {
-	shard := &e.stateShards[stateShardIndex(siteID)]
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
-	if site, ok := shard.values[siteID]; ok {
-		if pt, exists := site[testID]; exists {
-			return pt, true
-		}
-	}
-	return DataPoint{}, false
-}
-
-func (e *Engine) GetLatestSite(siteID int64) map[int64]DataPoint {
-	shard := &e.stateShards[stateShardIndex(siteID)]
-	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-
-	result := make(map[int64]DataPoint)
-	if site, ok := shard.values[siteID]; ok {
-		for testID, pt := range site {
-			result[testID] = pt
-		}
-	}
-	return result
 }
 
 // ============================================================================

@@ -40,12 +40,19 @@ func TestVerifyCoreFunctionality(t *testing.T) {
 	// Wait for flush (need > ChunkFlushInterval + writer flush interval)
 	time.Sleep(3 * time.Second)
 
-	// Real-time query
-	pt, exists := engine.GetLatestTest(100, 5001)
-	if !exists || pt.Value != 42 {
-		t.Errorf("Real-time query failed: exists=%v, value=%d", exists, pt.Value)
+	// Recent range query (includes unflushed memory points for 5m)
+	recent, err := engine.GetSiteTestRange(100, 5001, 1000, 1000, Scale5m)
+	if err != nil {
+		t.Fatalf("Recent range query failed: %v", err)
+	}
+	if len(recent) == 0 || recent[len(recent)-1].Value != 42 {
+		val := int64(-1)
+		if len(recent) > 0 {
+			val = recent[len(recent)-1].Value
+		}
+		t.Errorf("Recent range query failed: got %d points, latest value=%d", len(recent), val)
 	} else {
-		fmt.Println("✓ Real-time query works")
+		fmt.Println("✓ Recent range query works")
 	}
 
 	// Check database before query
